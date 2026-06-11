@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 环境变量（含密钥）
+.env
+.venv/
+venv/
+
+# 数据目录（浏览器 profile、数据库、日志）
+data/
+
+# 调试探查产物
+explore_compass.py
+inspect_html.py
+probe_page.py
+probe_dom.py
+probe_react.py
+compass_html.txt
+compass_explore.png
+captured_requests.json
+next_buttons.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Cron 运行时
+.accio/
+
+# Claude Code
+.claude/

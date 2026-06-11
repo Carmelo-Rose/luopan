@@ -1,0 +1,70 @@
+"""
+集中管理所有配置，从 .env 读取并提供类型化属性。
+"""
+import logging
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_logger = logging.getLogger(__name__)
+
+
+def _safe_int(name: str, default: int) -> int:
+    """安全解析整数环境变量，无效值回退到默认值并记录警告。"""
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _logger.warning("环境变量 %s=%r 无法解析为整数，使用默认值 %d", name, raw, default)
+        return default
+
+
+# ── 路径 ──────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH: str = os.getenv("DB_PATH", str(BASE_DIR / "data" / "compass.db"))
+
+# ── 浏览器 ────────────────────────────────────────────────────────────
+BROWSER_USER_DATA_DIR: str = os.getenv("BROWSER_USER_DATA_DIR", "")
+BROWSER_CHANNEL: str = os.getenv("BROWSER_CHANNEL", "chrome")
+
+# ── 采集参数 ──────────────────────────────────────────────────────────
+COMPASS_URL: str = os.getenv(
+    "COMPASS_URL",
+    "https://compass.jinritemai.com/screen/rank/product/card",
+)
+PAGE_SIZE: int = _safe_int("PAGE_SIZE", 10)
+TOTAL_PAGES: int = _safe_int("TOTAL_PAGES", 20)
+# 固定行业类目（单类目模式，向后兼容）；留空可恢复为跟随罗盘页面当前选择。
+INDUSTRY_ID: str = os.getenv("INDUSTRY_ID", "")
+CATEGORY_ID: str = os.getenv("CATEGORY_ID", "")
+CATEGORY_NAME: str = os.getenv("CATEGORY_NAME", "")
+
+# 多类目模式：目标一级类目名称列表（逗号分隔）。
+# 系统自动发现这些一级类目下的所有二级类目，逐个采集。
+# 留空则回退到单类目模式（使用上面的 INDUSTRY_ID / CATEGORY_ID）。
+TARGET_L1_CATEGORIES: list[str] = [
+    s.strip()
+    for s in os.getenv("TARGET_L1_CATEGORIES", "智能家居,玩具乐器,钟表配饰,图书教育,服装内衣").split(",")
+    if s.strip()
+]
+
+# 类目树缓存文件路径
+CATEGORY_TREE_CACHE: str = os.getenv(
+    "CATEGORY_TREE_CACHE", str(BASE_DIR / "data" / "category_tree.json")
+)
+
+# 采集完整性下限：低于此条数视为本轮采集失败（如 Cookie 中途失效），
+# 拒绝写入残缺快照，避免污染差分。默认 = 满额的 80%。
+MIN_PRODUCTS: int = _safe_int("MIN_PRODUCTS", int(PAGE_SIZE * TOTAL_PAGES * 0.8))
+
+# ── 推送 ──────────────────────────────────────────────────────────────
+NOTIFY_CHANNEL: str = os.getenv("NOTIFY_CHANNEL", "wecom")
+WECOM_WEBHOOK_URL: str = os.getenv("WECOM_WEBHOOK_URL", "")
+LARK_WEBHOOK_URL: str = os.getenv("LARK_WEBHOOK_URL", "")
+
+# 注：差分阈值的唯一真相源在 monitor/diff.py:_classify_rank_delta，
+# 不在此处配置（曾有一份从未被引用且与硬编码不一致的死配置，已移除）。
