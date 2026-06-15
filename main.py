@@ -388,6 +388,12 @@ async def run_multi(
                 category_results=category_results,
             )
 
+        # ── 飞书多维表格同步（独立于企微通知，配齐 token 才执行）──────
+        if not dry_run and all_events and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
+            from notify.lark import sync_events_to_base
+            written = sync_events_to_base(all_events, run_id)
+            logger.info("飞书 Base 同步: 写入 %d / %d 条事件", written, len(all_events))
+
         logger.info(
             "═══ 多类目采集完成 | %d 个类目 | %d 条商品 | %d 条事件 | baseline=%d ═══",
             categories_collected, total_products, len(all_events), baseline_count,

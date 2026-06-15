@@ -80,6 +80,13 @@ NOTIFY_CHANNEL: str = os.getenv("NOTIFY_CHANNEL", "wecom") or "none"
 WECOM_WEBHOOK_URL: str = os.getenv("WECOM_WEBHOOK_URL", "")
 LARK_WEBHOOK_URL: str = os.getenv("LARK_WEBHOOK_URL", "")
 
+# ── 飞书多维表格同步（独立于上面的通知渠道）──────────────────────────
+# 配齐 APP_TOKEN + TABLE_ID 即启用；每轮把异动事件写入该 Base 表。
+# 写入经本机 lark-cli 子进程，身份默认 user（token 自动续期，适合每小时 cron）。
+LARK_BASE_APP_TOKEN: str = os.getenv("LARK_BASE_APP_TOKEN", "")
+LARK_TABLE_ID: str = os.getenv("LARK_TABLE_ID", "")
+LARK_AS: str = os.getenv("LARK_AS", "user")  # user | bot
+
 # 注：差分阈值的唯一真相源在 monitor/diff.py:_classify_rank_delta，
 # 不在此处配置（曾有一份从未被引用且与硬编码不一致的死配置，已移除）。
 
