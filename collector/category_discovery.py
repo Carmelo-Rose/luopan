@@ -95,18 +95,107 @@ def _node_id(node: dict) -> str:
     return str(node.get("value") or node.get("cate_id") or "")
 
 
+def _raw_dump_path() -> str:
+    """原始类目树落盘路径（与类目树缓存同目录）。"""
+    return os.path.join(
+        os.path.dirname(settings.CATEGORY_TREE_CACHE), "category_raw_dump.json"
+    )
+
+
 def _dump_raw_tree(raw_options: list) -> None:
     """把提取到的完整原始类目树（含各级 children/isLeaf）落盘，便于离线核对结构。"""
     try:
-        dump_path = os.path.join(
-            os.path.dirname(settings.CATEGORY_TREE_CACHE), "category_raw_dump.json"
-        )
+        dump_path = _raw_dump_path()
         os.makedirs(os.path.dirname(dump_path), exist_ok=True)
         with open(dump_path, "w", encoding="utf-8") as f:
             json.dump(raw_options, f, ensure_ascii=False, indent=2)
         logger.info("原始类目树已 dump 到: %s（供核对结构/「全部」层级）", dump_path)
     except Exception as e:
         logger.warning("dump 原始类目树失败: %s", e)
+
+
+def flatten_category_lookup(raw_options: list) -> dict:
+    """
+    把完整类目树（L1→L5）拍平为 {cate_id: {l1,l2,l3,leaf,path}} 索引。
+
+    用于把商品自带的 leaf_category_id 翻译成各层级名字：
+      - l3   = 叶子往上数第 3 层（三级类目，所有商品层级统一）
+      - leaf = 该节点自身名字（最细类目）
+    「全部」占位节点不建索引（但仍向下遍历其 children）。
+    """
+    lookup: dict[str, dict] = {}
+
+    def walk(node: dict, path: list[tuple[str, str]]) -> None:
+        name = _clean_label(node)
+        cid = _node_id(node)
+        if not name or name == _ALL_NODE_LABEL or not cid or cid == "0":
+            new_path = path  # 占位节点不进 path、不建索引
+        else:
+            new_path = path + [(cid, name)]
+            names = [n for _, n in new_path]
+            lookup[cid] = {
+                "l1": names[0] if len(names) >= 1 else "",
+                "l2": names[1] if len(names) >= 2 else "",
+                "l3": names[2] if len(names) >= 3 else "",
+                "leaf": names[-1],
+                "path": names,
+            }
+        for child in (node.get("children") or []):
+            walk(child, new_path)
+
+    for root in raw_options:
+        walk(root, [])
+    return lookup
+
+
+def save_category_lookup(cache_path: str, lookup: dict) -> None:
+    """保存类目拍平索引到缓存文件。"""
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(lookup, f, ensure_ascii=False, indent=2)
+        logger.info("类目拍平索引已缓存到: %s（%d 个 cate_id）", cache_path, len(lookup))
+    except Exception as e:
+        logger.warning("保存类目拍平索引失败: %s", e)
+
+
+def load_category_lookup(cache_path: str) -> Optional[dict]:
+    """加载类目拍平索引；不存在或损坏返回 None。无 TTL（随类目发现一起刷新）。"""
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            lookup = json.load(f)
+        logger.info("加载类目拍平索引: %s（%d 个 cate_id）", cache_path, len(lookup))
+        return lookup
+    except Exception as e:
+        logger.warning("加载类目拍平索引失败: %s", e)
+        return None
+
+
+def ensure_category_lookup(cache_path: str) -> dict:
+    """
+    返回类目拍平索引；缓存缺失时尝试用已落盘的 category_raw_dump.json 现场构建并补缓存。
+
+    用于「类目树缓存命中、跳过了在线发现」的场景——此时 lookup 缓存可能尚未生成，
+    但原始树 dump 通常已存在，足以离线重建索引。最终拿不到返回空 dict（采集不报错，列留空）。
+    """
+    lookup = load_category_lookup(cache_path)
+    if lookup:
+        return lookup
+    dump_path = _raw_dump_path()
+    if os.path.exists(dump_path):
+        try:
+            with open(dump_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            lookup = flatten_category_lookup(raw)
+            if lookup:
+                save_category_lookup(cache_path, lookup)
+                logger.info("类目拍平索引缺失，已从原始树 dump 重建")
+                return lookup
+        except Exception as e:
+            logger.warning("从原始类目树 dump 重建拍平索引失败: %s", e)
+    return {}
 
 
 async def discover_categories(page: Page, target_l1_names: list[str]) -> dict:
@@ -145,6 +234,15 @@ async def discover_categories(page: Page, target_l1_names: list[str]) -> dict:
     raw_options = result.get("options", [])
     logger.info("从 React fiber 提取到 %d 个一级类目", len(raw_options))
     _dump_raw_tree(raw_options)
+
+    # 同步刷新「id→三级/叶子类目名」拍平索引（采集器据此翻译商品 leaf_category_id）。
+    # 注意：采集粒度虽是 L2，但索引覆盖全树各层，供商品叶子类目反查。
+    try:
+        save_category_lookup(
+            settings.CATEGORY_LOOKUP_CACHE, flatten_category_lookup(raw_options)
+        )
+    except Exception as e:
+        logger.warning("构建类目拍平索引失败（非致命）: %s", e)
 
     target_set = set(target_l1_names)
     discover_all = not target_set

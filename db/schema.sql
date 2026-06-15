@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS products_snapshot (
     captured_at      TEXT    NOT NULL,          -- ISO datetime
     industry_name    TEXT    DEFAULT '',        -- 一级类目名（如 智能家居）
     category_name    TEXT    DEFAULT '',        -- 二级类目名（如 五金）
+    category_l3_name TEXT    DEFAULT '',        -- 三级类目名（商品叶子类目往上数第3层）
+    leaf_category_name TEXT  DEFAULT '',        -- 叶子（最细）类目名
     UNIQUE (run_id, scope_key, product_id)
 );
 
@@ -38,6 +40,8 @@ CREATE TABLE IF NOT EXISTS ranking_event (
     notified       INTEGER NOT NULL DEFAULT 0,  -- 0=待推送 1=已推送
     industry_name  TEXT    DEFAULT '',          -- 一级类目名
     category_name  TEXT    DEFAULT '',          -- 二级类目名
+    category_l3_name TEXT  DEFAULT '',          -- 三级类目名
+    leaf_category_name TEXT DEFAULT '',         -- 叶子（最细）类目名
     UNIQUE (run_id, scope_key, event_type, product_id)   -- 去重防重入
 );
 

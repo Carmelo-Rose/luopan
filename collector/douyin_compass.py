@@ -21,6 +21,7 @@ from playwright.async_api import (
 )
 
 from config import settings
+from collector.category_discovery import ensure_category_lookup
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,9 @@ def _parse_card(
     info = card.get("product_info", {})
     product_id = str(info.get("id", ""))
     product_title = info.get("name", "")
+    # 商品自带的叶子（最细）类目 id；翻译成三级/叶子类目名在 collect() 末尾统一处理。
+    _leaf_cid = info.get("leaf_category_id")
+    leaf_category_id = str(_leaf_cid) if _leaf_cid not in (None, "") else ""
     product_url = info.get("product_detail_h5_url", "")
     if not product_url and product_id:
         product_url = (
@@ -161,6 +165,9 @@ def _parse_card(
         "scope_key": scope_key,
         "industry_name": industry_name,
         "category_name": category_name,
+        "leaf_category_id": leaf_category_id,
+        "category_l3_name": "",      # collect() 末尾据 leaf_category_id 反查填入
+        "leaf_category_name": "",
     }
 
 
@@ -302,6 +309,10 @@ async def _parse_dom_rows(
             "scope_key": scope_key,
             "industry_name": industry_name,
             "category_name": category_name,
+            # DOM 降级路径拿不到接口字段，三级/叶子类目留空（兜底，罕见）
+            "leaf_category_id": "",
+            "category_l3_name": "",
+            "leaf_category_name": "",
         })
     return products
 
@@ -337,6 +348,9 @@ class DouyinCompassCollector:
         self._playwright = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+
+        # 类目拍平索引（cate_id→三级/叶子类目名）。缺失时三级/叶子列留空，不影响采集。
+        self._cat_lookup: dict = ensure_category_lookup(settings.CATEGORY_LOOKUP_CACHE)
 
         # 缓存首页的请求参数（从拦截的 URL 中提取），用于后续翻页
         self._base_api_params: dict = {}
@@ -469,6 +483,9 @@ class DouyinCompassCollector:
                 seen[p["product_id"]] = p
         result = sorted(seen.values(), key=lambda x: x["rank"])
 
+        # 据商品 leaf_category_id 反查三级类目 + 叶子类目名
+        self._enrich_categories(result)
+
         if collection_failed or len(result) < settings.MIN_PRODUCTS:
             logger.warning(
                 "采集不完整（去重后 %d 条，下限 %d，中途失败=%s），返回空",
@@ -478,6 +495,23 @@ class DouyinCompassCollector:
 
         logger.info("采集完成 [%s>%s]，去重后共 %d 条商品", ind_name, cat_name, len(result))
         return result
+
+    def _enrich_categories(self, products: list[dict]) -> None:
+        """据商品 leaf_category_id 反查并就地填入 category_l3_name / leaf_category_name。
+
+        索引缺失或某商品的 leaf_category_id 查不到时，对应字段保持空（不报错）。
+        """
+        lookup = self._cat_lookup
+        if not lookup:
+            return
+        hit = 0
+        for p in products:
+            entry = lookup.get(p.get("leaf_category_id", ""))
+            if entry:
+                p["category_l3_name"] = entry.get("l3", "")
+                p["leaf_category_name"] = entry.get("leaf", "")
+                hit += 1
+        logger.info("三级/叶子类目反查: %d/%d 条命中", hit, len(products))
 
     async def collect_multi(
         self,

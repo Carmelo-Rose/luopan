@@ -41,6 +41,8 @@ _THIN_BORDER = Border(
 _COLUMNS = [
     ("一级类目", 12),
     ("二级类目", 12),
+    ("三级类目", 14),
+    ("叶子类目", 16),
     ("当前排名", 10),
     ("排名变化", 10),
     ("上轮排名", 10),
@@ -164,6 +166,8 @@ def _write_events(ws, events: list[dict]) -> None:
         values = [
             ev.get("industry_name", ""),
             ev.get("category_name", ""),
+            ev.get("category_l3_name", ""),
+            ev.get("leaf_category_name", ""),
             ev.get("rank_current"),
             f"↑{rank_delta}" if rank_delta else ("新进榜" if rank_prev is None else ""),
             rank_prev if rank_prev is not None else "-",
@@ -179,9 +183,9 @@ def _write_events(ws, events: list[dict]) -> None:
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.border = _THIN_BORDER
             cell.alignment = Alignment(
-                horizontal="center" if col_idx <= 6 else "left",
+                horizontal="center" if col_idx <= 8 else "left",
                 vertical="center",
-                wrap_text=(col_idx == 7),
+                wrap_text=(col_idx == 9),
             )
             if is_warning:
                 cell.fill = _WARN_FILL

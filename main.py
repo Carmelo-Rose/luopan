@@ -70,6 +70,9 @@ def _generate_mock_products(
             "scope_key": scope_key,
             "industry_name": industry_name,
             "category_name": category_name,
+            "leaf_category_id": "",
+            "category_l3_name": "Mock三级",
+            "leaf_category_name": "Mock叶子",
         })
     if seed_shift > 0:
         for j in range(3):

@@ -160,4 +160,6 @@ def _make_event(
         "created_at": created_at,
         "industry_name": row.get("industry_name", ""),
         "category_name": row.get("category_name", ""),
+        "category_l3_name": row.get("category_l3_name", ""),
+        "leaf_category_name": row.get("leaf_category_name", ""),
     }

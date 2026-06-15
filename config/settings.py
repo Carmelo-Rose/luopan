@@ -66,6 +66,11 @@ CATEGORY_TREE_CACHE: str = os.getenv(
     "CATEGORY_TREE_CACHE", str(BASE_DIR / "data" / "category_tree.json")
 )
 
+# 类目 id→层级名 拍平索引缓存（用于把商品 leaf_category_id 翻译成三级/叶子类目名）
+CATEGORY_LOOKUP_CACHE: str = os.getenv(
+    "CATEGORY_LOOKUP_CACHE", str(BASE_DIR / "data" / "category_lookup.json")
+)
+
 # 采集完整性下限：低于此条数视为本轮采集失败（如 Cookie 中途失效），
 # 拒绝写入残缺快照，避免污染差分。默认 = 满额的 80%。
 MIN_PRODUCTS: int = _safe_int("MIN_PRODUCTS", int(PAGE_SIZE * TOTAL_PAGES * 0.8))

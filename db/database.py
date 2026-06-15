@@ -20,11 +20,31 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+# 新增列迁移：(表名, 列名)。schema.sql 用 CREATE TABLE IF NOT EXISTS，
+# 不会给已存在的旧库补列，故对已有 DB 用 ALTER TABLE 幂等补齐。
+# 含 industry_name/category_name：早期 schema 无此列，老库需一并补齐。
+_COLUMN_MIGRATIONS = [
+    ("products_snapshot", "industry_name"),
+    ("products_snapshot", "category_name"),
+    ("products_snapshot", "category_l3_name"),
+    ("products_snapshot", "leaf_category_name"),
+    ("ranking_event", "industry_name"),
+    ("ranking_event", "category_name"),
+    ("ranking_event", "category_l3_name"),
+    ("ranking_event", "leaf_category_name"),
+]
+
+
 def init_db(db_path: str) -> None:
-    """建表（幂等）。"""
+    """建表（幂等）+ 对旧库补齐新增列。"""
     conn = get_connection(db_path)
     try:
         conn.executescript(_SCHEMA_PATH.read_text(encoding="utf-8"))
+        for table, col in _COLUMN_MIGRATIONS:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass  # 列已存在（新库由 schema.sql 建好），忽略
         conn.commit()
     finally:
         conn.close()
@@ -38,14 +58,20 @@ def insert_snapshot(conn: sqlite3.Connection, run_id: str, rows: list[dict]) -> 
         INSERT OR IGNORE INTO products_snapshot
             (run_id, scope_key, rank, product_id, product_title, product_url,
              price_range, pay_amount, clicks, conversion_rate,
-             card_order_count, captured_at, industry_name, category_name)
+             card_order_count, captured_at, industry_name, category_name,
+             category_l3_name, leaf_category_name)
         VALUES
             (:run_id, :scope_key, :rank, :product_id, :product_title, :product_url,
              :price_range, :pay_amount, :clicks, :conversion_rate,
              :card_order_count, :captured_at,
-             COALESCE(:industry_name, ''), COALESCE(:category_name, ''))
+             COALESCE(:industry_name, ''), COALESCE(:category_name, ''),
+             COALESCE(:category_l3_name, ''), COALESCE(:leaf_category_name, ''))
     """
-    data = [{**r, "run_id": run_id} for r in rows]
+    # 防御性默认：旧调用方/测试可能不带新字段，统一补空避免绑定缺参
+    data = [
+        {"category_l3_name": "", "leaf_category_name": "", **r, "run_id": run_id}
+        for r in rows
+    ]
     conn.executemany(sql, data)
     conn.commit()
 
@@ -115,14 +141,20 @@ def insert_events(conn: sqlite3.Connection, events: list[dict]) -> int:
         INSERT OR IGNORE INTO ranking_event
             (run_id, scope_key, event_type, product_id, product_title, product_url,
              rank_current, rank_previous, rank_delta, created_at, notified,
-             industry_name, category_name)
+             industry_name, category_name, category_l3_name, leaf_category_name)
         VALUES
             (:run_id, :scope_key, :event_type, :product_id, :product_title, :product_url,
              :rank_current, :rank_previous, :rank_delta, :created_at, 0,
-             COALESCE(:industry_name, ''), COALESCE(:category_name, ''))
+             COALESCE(:industry_name, ''), COALESCE(:category_name, ''),
+             COALESCE(:category_l3_name, ''), COALESCE(:leaf_category_name, ''))
     """
+    # 防御性默认：旧调用方/测试可能不带新字段，统一补空避免绑定缺参
+    data = [
+        {"category_l3_name": "", "leaf_category_name": "", **e}
+        for e in events
+    ]
     before = conn.total_changes
-    conn.executemany(sql, events)
+    conn.executemany(sql, data)
     conn.commit()
     return conn.total_changes - before
 
