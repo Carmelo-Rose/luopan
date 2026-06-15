@@ -13,8 +13,11 @@
 注意：排名数值越小越好（rank=1 最优）。
       delta = rank_previous - rank_current（正数 = 排名上升）。
 """
+import logging
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 EventType = str
@@ -80,16 +83,23 @@ def compute_diff(
         now = datetime.now(timezone.utc)
     created_at = now.isoformat()
 
-    # 上一轮：product_id -> rank
-    prev_map: dict[str, int] = {
-        row["product_id"]: row["rank"] for row in previous_snapshot
-    }
+    # 上一轮：product_id -> rank，检测重复 product_id
+    prev_map: dict[str, int] = {}
+    for row in previous_snapshot:
+        pid = row["product_id"]
+        if pid in prev_map:
+            logger.warning("上一轮快照中存在重复 product_id=%s（保留 rank=%d）", pid, row["rank"])
+        prev_map[pid] = row["rank"]
 
     events: list[dict] = []
 
     for row in current_snapshot:
         pid = row["product_id"]
         rank_cur = row["rank"]
+
+        if not isinstance(rank_cur, int) or rank_cur < 1:
+            logger.warning("无效排名 rank_cur=%r (product_id=%s)，跳过", rank_cur, pid)
+            continue
 
         if pid not in prev_map:
             # 新进榜

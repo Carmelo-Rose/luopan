@@ -184,7 +184,11 @@ async def run_multi(
     run_id = datetime.now(timezone.utc).isoformat()
     ts = datetime.now()
     logger.info("═══ 多类目模式 run_id: %s ═══", run_id)
-    logger.info("目标一级类目: %s", settings.TARGET_L1_CATEGORIES)
+    logger.info(
+        "目标一级类目: %s",
+        "账号可见的全部一级类目" if settings.TARGET_ALL_L1_CATEGORIES
+        else settings.TARGET_L1_CATEGORIES,
+    )
 
     db_path = settings.DB_PATH
     database.init_db(db_path)
@@ -195,12 +199,18 @@ async def run_multi(
     categories_collected = 0
     baseline_count = 0
     excel_path = ""
+    category_results: list[dict] = []
 
     try:
         if mock:
             # Mock 模式：为每个目标 L1 生成 2 个 L2 的 mock 数据
             categories = []
-            for l1 in settings.TARGET_L1_CATEGORIES:
+            mock_l1_categories = settings.TARGET_L1_CATEGORIES
+            if settings.TARGET_ALL_L1_CATEGORIES:
+                from collector.category_discovery import load_category_tree
+                cached_tree = load_category_tree(settings.CATEGORY_TREE_CACHE) or {}
+                mock_l1_categories = list(cached_tree.keys())
+            for l1 in mock_l1_categories:
                 for l2_suffix in ["类目A", "类目B"]:
                     categories.append({
                         "industry_name": l1,
@@ -230,50 +240,136 @@ async def run_multi(
 
             logger.info("共发现 %d 个二级类目待采集", len(categories))
             from collector.douyin_compass import DouyinCompassCollector
+            import asyncio as _aio
             async with DouyinCompassCollector() as collector:
-                results = await collector.collect_multi(
-                    categories=categories,
-                    scope_prefix=scope_prefix,
+                total_cats = len(categories)
+                for idx, cat in enumerate(categories, 1):
+                    ind_name = cat.get("industry_name", "")
+                    cat_name = cat.get("category_name", "")
+                    ind_id = cat.get("industry_id", "")
+                    cat_id = cat.get("category_id", "")
+                    scope_key = f"{scope_prefix}_{ind_name}_{cat_name}"
+
+                    logger.info("═══ [%d/%d] 采集 %s > %s ═══", idx, total_cats, ind_name, cat_name)
+                    try:
+                        products = await collector.collect(
+                            scope_key=scope_key,
+                            industry_id=ind_id,
+                            category_id=cat_id,
+                            industry_name=ind_name,
+                            category_name=cat_name,
+                            _reuse_page=(idx > 1),
+                        )
+                    except Exception as e:
+                        logger.error("[%d/%d] %s > %s 采集异常: %s", idx, total_cats, ind_name, cat_name, e)
+                        category_results.append({
+                            "industry_name": ind_name, "category_name": cat_name,
+                            "status": "采集异常", "products": 0, "events": 0,
+                        })
+                        continue
+
+                    logger.info("[%d/%d] %s > %s 完成: %d 条", idx, total_cats, ind_name, cat_name, len(products))
+
+                    # 即时写入 + 差分，不等全部完成
+                    cat_total = len(products)
+                    if cat_total < settings.MIN_PRODUCTS:
+                        logger.warning("[%s] 采集 %d 条低于下限，跳过", scope_key, cat_total)
+                        category_results.append({
+                            "industry_name": ind_name, "category_name": cat_name,
+                            "status": "采集失败", "products": cat_total, "events": 0,
+                        })
+                        continue
+
+                    categories_collected += 1
+                    total_products += cat_total
+                    logger.info("[%s] 写入快照 (%d 条)", scope_key, cat_total)
+                    database.insert_snapshot(conn, run_id, products)
+
+                    latest_run, previous_run = database.get_latest_two_run_ids(conn, scope_key)
+                    if previous_run is None:
+                        logger.info("[%s] 首次运行，仅 baseline", scope_key)
+                        baseline_count += 1
+                        category_results.append({
+                            "industry_name": ind_name, "category_name": cat_name,
+                            "status": "首次基线", "products": cat_total, "events": 0,
+                        })
+                        continue
+
+                    current_snap = database.get_snapshot(conn, latest_run, scope_key)
+                    previous_snap = database.get_snapshot(conn, previous_run, scope_key)
+
+                    events = compute_diff(
+                        run_id, scope_key, current_snap, previous_snap,
+                    )
+                    logger.info("[%s] 差分: %d 条事件", scope_key, len(events))
+
+                    if events:
+                        database.insert_events(conn, events)
+                        all_events.extend(events)
+                    category_results.append({
+                        "industry_name": ind_name, "category_name": cat_name,
+                        "status": "有异动" if events else "无异动",
+                        "products": cat_total, "events": len(events),
+                    })
+
+                    if idx < total_cats:
+                        await _aio.sleep(3)
+
+        # ── 逐类目处理（仅 mock 模式走这里，真实采集已在上面循环中处理）──
+        if mock:
+            for scope_key, products in results.items():
+                sample = products[0] if products else {}
+                ind_name = sample.get("industry_name", "")
+                cat_name = sample.get("category_name", "")
+                cat_total = len(products)
+                if cat_total < settings.MIN_PRODUCTS:
+                    logger.warning("[%s] 采集 %d 条低于下限，跳过", scope_key, cat_total)
+                    category_results.append({
+                        "industry_name": ind_name, "category_name": cat_name,
+                        "status": "采集失败", "products": cat_total, "events": 0,
+                    })
+                    continue
+
+                categories_collected += 1
+                total_products += cat_total
+                logger.info("[%s] 写入快照 (%d 条)", scope_key, cat_total)
+                database.insert_snapshot(conn, run_id, products)
+
+                latest_run, previous_run = database.get_latest_two_run_ids(conn, scope_key)
+                if previous_run is None:
+                    logger.info("[%s] 首次运行，仅 baseline", scope_key)
+                    baseline_count += 1
+                    category_results.append({
+                        "industry_name": ind_name, "category_name": cat_name,
+                        "status": "首次基线", "products": cat_total, "events": 0,
+                    })
+                    continue
+
+                current_snap = database.get_snapshot(conn, latest_run, scope_key)
+                previous_snap = database.get_snapshot(conn, previous_run, scope_key)
+
+                events = compute_diff(
+                    run_id, scope_key, current_snap, previous_snap,
                 )
+                logger.info("[%s] 差分: %d 条事件", scope_key, len(events))
 
-        # ── 逐类目处理：写快照 → 差分 → 收集事件 ────────────────
-        for scope_key, products in results.items():
-            cat_total = len(products)
-            if cat_total < settings.MIN_PRODUCTS:
-                logger.warning("[%s] 采集 %d 条低于下限，跳过", scope_key, cat_total)
-                continue
+                if events:
+                    database.insert_events(conn, events)
+                    all_events.extend(events)
+                category_results.append({
+                    "industry_name": ind_name, "category_name": cat_name,
+                    "status": "有异动" if events else "无异动",
+                    "products": cat_total, "events": len(events),
+                })
 
-            categories_collected += 1
-            total_products += cat_total
-            logger.info("[%s] 写入快照 (%d 条)", scope_key, cat_total)
-            database.insert_snapshot(conn, run_id, products)
-
-            latest_run, previous_run = database.get_latest_two_run_ids(conn, scope_key)
-            if previous_run is None:
-                logger.info("[%s] 首次运行，仅 baseline", scope_key)
-                baseline_count += 1
-                continue
-
-            current_snap = database.get_snapshot(conn, latest_run, scope_key)
-            previous_snap = database.get_snapshot(conn, previous_run, scope_key)
-
-            # 从快照中获取类目名
-            ind_name = current_snap[0].get("industry_name", "") if current_snap else ""
-            cat_name = current_snap[0].get("category_name", "") if current_snap else ""
-
-            events = compute_diff(
-                run_id, scope_key, current_snap, previous_snap,
-                industry_name=ind_name, category_name=cat_name,
+        # ── 生成 Excel 报告（dry-run 不产生副作用）──────────────────
+        excel_path = ""
+        if not dry_run:
+            report_dir = os.path.join(settings.BASE_DIR, "data", "reports")
+            excel_path = generate_report(
+                all_events, report_dir, timestamp=ts,
+                category_results=category_results,
             )
-            logger.info("[%s] 差分: %d 条事件", scope_key, len(events))
-
-            if events:
-                database.insert_events(conn, events)
-                all_events.extend(events)
-
-        # ── 生成 Excel 报告 ──────────────────────────────────────
-        report_dir = os.path.join(settings.BASE_DIR, "data", "reports")
-        excel_path = generate_report(all_events, report_dir, timestamp=ts)
 
         # ── 企微摘要推送 ─────────────────────────────────────────
         if dry_run:
@@ -284,7 +380,10 @@ async def run_multi(
                             e.get("category_name", ""), e["rank_current"],
                             e["product_title"][:30])
         else:
-            _dispatch_summary(conn, all_events, categories_collected, excel_path, ts)
+            _dispatch_summary(
+                conn, all_events, categories_collected, excel_path, ts,
+                category_results=category_results,
+            )
 
         logger.info(
             "═══ 多类目采集完成 | %d 个类目 | %d 条商品 | %d 条事件 | baseline=%d ═══",
@@ -297,6 +396,7 @@ async def run_multi(
             "total_products": total_products,
             "all_events": all_events,
             "excel_path": excel_path,
+            "category_results": category_results,
         }
 
     finally:
@@ -319,15 +419,22 @@ async def _resolve_categories() -> list[dict]:
     cache_path = settings.CATEGORY_TREE_CACHE
     tree = load_category_tree(cache_path)
 
+    # 检测缺失的 L1（配置了但缓存中没有）
+    target_l1 = set(settings.TARGET_L1_CATEGORIES)
+    discover_all = settings.TARGET_ALL_L1_CATEGORIES
+    if discover_all:
+        # 旧缓存可能是按目标名单过滤后的子集，全部类目模式必须重新发现。
+        tree = None
+    cached_l1 = set(tree.keys()) if tree else set()
+    missing_l1 = target_l1 - cached_l1 if not discover_all else set()
+
     if not tree:
         logger.info("类目树缓存不存在或为空，启动浏览器自动发现...")
         from collector.douyin_compass import DouyinCompassCollector
         async with DouyinCompassCollector() as collector:
             page = collector._page
-            from playwright.async_api import Response
-            # 先导航到榜单页
             await page.goto(
-                "https://compass.jinritemai.com/shop/chance/merchandise-product-rank?rank_type=3",
+                settings.RANK_ENTRY_URL,
                 wait_until="domcontentloaded", timeout=60000,
             )
             await page.wait_for_timeout(3000)
@@ -339,9 +446,30 @@ async def _resolve_categories() -> list[dict]:
             logger.warning("自动发现未找到任何目标类目")
             return []
 
+    elif missing_l1:
+        logger.info("类目树缓存缺少 %d 个一级类目: %s，补充发现...", len(missing_l1), list(missing_l1))
+        from collector.douyin_compass import DouyinCompassCollector
+        async with DouyinCompassCollector() as collector:
+            page = collector._page
+            await page.goto(
+                settings.RANK_ENTRY_URL,
+                wait_until="domcontentloaded", timeout=60000,
+            )
+            await page.wait_for_timeout(3000)
+            new_tree = await discover_categories(page, list(missing_l1))
+
+        if new_tree:
+            tree.update(new_tree)
+            save_category_tree(cache_path, tree)
+            logger.info("补充发现 %d 个一级类目: %s", len(new_tree), list(new_tree.keys()))
+        else:
+            logger.warning("补充发现未找到任何缺失类目")
+
     # 展平为列表
     flat = []
     for l1_name, l2_list in tree.items():
+        if not discover_all and l1_name not in target_l1:
+            continue
         for l2 in l2_list:
             flat.append({
                 "industry_name": l1_name,
@@ -361,7 +489,7 @@ async def do_discover() -> None:
     async with DouyinCompassCollector() as collector:
         page = collector._page
         await page.goto(
-            "https://compass.jinritemai.com/shop/chance/merchandise-product-rank?rank_type=3",
+            settings.RANK_ENTRY_URL,
             wait_until="domcontentloaded", timeout=60000,
         )
         await page.wait_for_timeout(3000)
@@ -382,8 +510,11 @@ async def do_discover() -> None:
 # ── 推送辅助 ──────────────────────────────────────────────────────────
 
 def _dispatch_events(conn, events: list[dict], scope_key: str) -> None:
-    """推送事件到配置的渠道。"""
-    pending = database.get_pending_events(conn)
+    """推送事件到配置的渠道（仅推送当前 scope 的 pending 事件）。"""
+    pending = [
+        e for e in database.get_pending_events(conn)
+        if e.get("scope_key") == scope_key
+    ]
     if not pending:
         return
     delivered = dispatcher.dispatch(pending, scope_key=scope_key)
@@ -399,25 +530,31 @@ def _dispatch_events(conn, events: list[dict], scope_key: str) -> None:
 def _dispatch_summary(
     conn, events: list[dict], cat_count: int,
     excel_path: str, ts: datetime,
+    category_results: list[dict] | None = None,
 ) -> None:
-    """多类目模式：发送企微摘要 + 标记事件。"""
-    # 发送摘要到企微
-    if events:
-        from notify.wecom import send_summary
-        send_summary(
-            settings.WECOM_WEBHOOK_URL,
-            events=events,
-            categories_count=cat_count,
-            excel_path=excel_path,
-            timestamp=ts,
-        )
+    """多类目模式：只推送企微摘要 + Excel 报告，不逐条推送事件。"""
+    from notify.wecom import send_summary
+    delivered = send_summary(
+        settings.WECOM_WEBHOOK_URL,
+        events=events,
+        categories_count=cat_count,
+        excel_path=excel_path,
+        timestamp=ts,
+        category_results=category_results,
+    )
 
-    # 推送所有 pending 事件（含本轮刚写入的 + 历史遗留未推送的）
-    pending = database.get_pending_events(conn)
-    if pending:
-        delivered = dispatcher.dispatch(pending, scope_key="multi")
-        if delivered:
-            database.mark_events_notified(conn, list(delivered))
+    if not delivered:
+        logger.warning("摘要或 Excel 未完整送达，本轮事件保留为待通知")
+        return
+
+    current_run_ids = {e.get("run_id") for e in events if e.get("run_id")}
+    current_ids = [
+        e["id"] for e in database.get_pending_events(conn)
+        if e.get("run_id") in current_run_ids and e.get("id") is not None
+    ]
+    if current_ids:
+        database.mark_events_notified(conn, current_ids)
+        logger.info("摘要模式: 标记本轮 %d 条事件为已通知", len(current_ids))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────
@@ -502,11 +639,6 @@ def main() -> None:
         )
         status = "BASELINE" if result["is_baseline"] else f"{len(result['events'])} 条事件"
         logger.info("=== 本轮完成 | %s | 采集 %d 条商品 ===", status, result["total_products"])
-
-
-if __name__ == "__main__":
-    main()
-�品 ===", status, result["total_products"])
 
 
 if __name__ == "__main__":

@@ -48,11 +48,20 @@ _COLUMNS = [
     ("商品标题", 50),
 ]
 
+_COVERAGE_COLUMNS = [
+    ("一级类目", 16),
+    ("二级类目", 28),
+    ("采集状态", 14),
+    ("商品数", 10),
+    ("异动数", 10),
+]
+
 
 def generate_report(
     events: list[dict],
     output_dir: str,
     timestamp: Optional[datetime] = None,
+    category_results: Optional[list[dict]] = None,
 ) -> str:
     """
     生成 Excel 报告文件。
@@ -74,8 +83,8 @@ def generate_report(
         logger.error("openpyxl 未安装，无法生成 Excel 报告")
         return ""
 
-    if not events:
-        logger.info("无事件数据，跳过 Excel 报告生成")
+    if not events and not category_results:
+        logger.info("无事件和采集覆盖数据，跳过 Excel 报告生成")
         return ""
 
     if timestamp is None:
@@ -94,14 +103,26 @@ def generate_report(
     _write_header(ws_summary)
     _write_events(ws_summary, sorted(events, key=_sort_key))
 
+    # ── Sheet 2: 本轮采集覆盖情况 ─────────────────────────────
+    ws_coverage = wb.create_sheet(title="采集覆盖")
+    _write_coverage(ws_coverage, category_results or [])
+
     # ── Sheet 2-N: 按一级类目分组 ──────────────────────────────
     l1_groups: dict[str, list[dict]] = {}
     for ev in events:
         l1 = ev.get("industry_name", "") or "未知"
         l1_groups.setdefault(l1, []).append(ev)
 
+    used_sheet_names: set[str] = {"汇总", "采集覆盖"}
     for l1_name in sorted(l1_groups.keys()):
-        sheet_name = l1_name[:31]  # Excel sheet name limit
+        sheet_name = l1_name[:31]
+        base_name = sheet_name
+        suffix = 1
+        while sheet_name in used_sheet_names:
+            suffix_str = f"({suffix})"
+            sheet_name = base_name[: 31 - len(suffix_str)] + suffix_str
+            suffix += 1
+        used_sheet_names.add(sheet_name)
         ws = wb.create_sheet(title=sheet_name)
         _write_header(ws)
         l1_events = sorted(l1_groups[l1_name], key=_sort_key)
@@ -171,3 +192,31 @@ def _write_events(ws, events: list[dict]) -> None:
     if events:
         last_col = chr(ord("A") + len(_COLUMNS) - 1)
         ws.auto_filter.ref = f"A1:{last_col}{len(events) + 1}"
+
+
+def _write_coverage(ws, category_results: list[dict]) -> None:
+    """写入本轮每个二级类目的采集、baseline 和异动状态。"""
+    for col_idx, (name, width) in enumerate(_COVERAGE_COLUMNS, 1):
+        cell = ws.cell(row=1, column=col_idx, value=name)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = _THIN_BORDER
+        ws.column_dimensions[cell.column_letter].width = width
+
+    for row_idx, result in enumerate(category_results, 2):
+        values = [
+            result.get("industry_name", ""),
+            result.get("category_name", ""),
+            result.get("status", ""),
+            result.get("products", 0),
+            result.get("events", 0),
+        ]
+        for col_idx, value in enumerate(values, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.border = _THIN_BORDER
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.freeze_panes = "A2"
+    if category_results:
+        ws.auto_filter.ref = f"A1:E{len(category_results) + 1}"

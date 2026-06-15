@@ -36,6 +36,10 @@ COMPASS_URL: str = os.getenv(
     "COMPASS_URL",
     "https://compass.jinritemai.com/screen/rank/product/card",
 )
+RANK_ENTRY_URL: str = os.getenv(
+    "RANK_ENTRY_URL",
+    "https://compass.jinritemai.com/shop/chance/merchandise-product-rank?rank_type=3",
+)
 PAGE_SIZE: int = _safe_int("PAGE_SIZE", 10)
 TOTAL_PAGES: int = _safe_int("TOTAL_PAGES", 20)
 # 固定行业类目（单类目模式，向后兼容）；留空可恢复为跟随罗盘页面当前选择。
@@ -46,11 +50,16 @@ CATEGORY_NAME: str = os.getenv("CATEGORY_NAME", "")
 # 多类目模式：目标一级类目名称列表（逗号分隔）。
 # 系统自动发现这些一级类目下的所有二级类目，逐个采集。
 # 留空则回退到单类目模式（使用上面的 INDUSTRY_ID / CATEGORY_ID）。
+_TARGET_L1_RAW = os.getenv(
+    "TARGET_L1_CATEGORIES",
+    "智能家居,玩具乐器,钟表配饰,图书教育,服饰内衣,个护家清,运动户外",
+).strip()
+TARGET_ALL_L1_CATEGORIES: bool = _TARGET_L1_RAW == "*"
 TARGET_L1_CATEGORIES: list[str] = [
     s.strip()
-    for s in os.getenv("TARGET_L1_CATEGORIES", "智能家居,玩具乐器,钟表配饰,图书教育,服装内衣").split(",")
+    for s in _TARGET_L1_RAW.split(",")
     if s.strip()
-]
+] if not TARGET_ALL_L1_CATEGORIES else []
 
 # 类目树缓存文件路径
 CATEGORY_TREE_CACHE: str = os.getenv(
@@ -62,9 +71,17 @@ CATEGORY_TREE_CACHE: str = os.getenv(
 MIN_PRODUCTS: int = _safe_int("MIN_PRODUCTS", int(PAGE_SIZE * TOTAL_PAGES * 0.8))
 
 # ── 推送 ──────────────────────────────────────────────────────────────
-NOTIFY_CHANNEL: str = os.getenv("NOTIFY_CHANNEL", "wecom")
+NOTIFY_CHANNEL: str = os.getenv("NOTIFY_CHANNEL", "wecom") or "none"
 WECOM_WEBHOOK_URL: str = os.getenv("WECOM_WEBHOOK_URL", "")
 LARK_WEBHOOK_URL: str = os.getenv("LARK_WEBHOOK_URL", "")
 
 # 注：差分阈值的唯一真相源在 monitor/diff.py:_classify_rank_delta，
 # 不在此处配置（曾有一份从未被引用且与硬编码不一致的死配置，已移除）。
+
+
+def validate() -> list[str]:
+    """校验必填配置项，返回错误信息列表（空 = 全部通过）。"""
+    errors: list[str] = []
+    if not BROWSER_USER_DATA_DIR:
+        errors.append("BROWSER_USER_DATA_DIR 未设置，Playwright 无法启动持久化浏览器上下文")
+    return errors

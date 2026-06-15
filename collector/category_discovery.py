@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Optional
 from playwright.async_api import Page
 
@@ -40,13 +41,18 @@ _REACT_EXTRACT_JS = """
     if (!fiber) return { error: 'no React fiber found' };
 
     let options = null;
+    let optionCount = 0;
     let current = fiber;
-    for (let i = 0; i < 50 && current; i++) {
+    for (let i = 0; i < 100 && current; i++) {
         const props = current.memoizedProps || current.pendingProps || {};
-        if (props.options && Array.isArray(props.options) && props.options.length > 0
-            && props.options[0].label) {
-            options = props.options;
-            break;
+        for (const key of ['options', 'treeData', 'items', 'data']) {
+            const candidate = props[key];
+            if (Array.isArray(candidate) && candidate.length > optionCount
+                && candidate[0] && (candidate[0].label || candidate[0].cate_name)
+                && candidate[0].children) {
+                options = candidate;
+                optionCount = candidate.length;
+            }
         }
         current = current.return;
     }
@@ -77,25 +83,56 @@ _REACT_EXTRACT_JS = """
 """
 
 
+# 级联里代表「该层全部」的特殊子节点文案。选中它即等于采集其父类目下所有商品。
+_ALL_NODE_LABEL = "全部"
+
+
+def _clean_label(node: dict) -> str:
+    return (node.get("label") or node.get("cate_name") or "").strip()
+
+
+def _node_id(node: dict) -> str:
+    return str(node.get("value") or node.get("cate_id") or "")
+
+
+def _dump_raw_tree(raw_options: list) -> None:
+    """把提取到的完整原始类目树（含各级 children/isLeaf）落盘，便于离线核对结构。"""
+    try:
+        dump_path = os.path.join(
+            os.path.dirname(settings.CATEGORY_TREE_CACHE), "category_raw_dump.json"
+        )
+        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(raw_options, f, ensure_ascii=False, indent=2)
+        logger.info("原始类目树已 dump 到: %s（供核对结构/「全部」层级）", dump_path)
+    except Exception as e:
+        logger.warning("dump 原始类目树失败: %s", e)
+
+
 async def discover_categories(page: Page, target_l1_names: list[str]) -> dict:
     """
-    从 React fiber 中提取类目树，按目标一级类目过滤。
+    从 React fiber 中提取类目树，按目标一级类目过滤，采集粒度为二级类目（L2）。
+
+    选中某个 L2 后其下都有一个「全部」(value=0) 占位项，选它即代表采集该 L2
+    全部商品，故 category_id 用 L2 自身 id（不是「全部」节点的 0）。
 
     Returns
     -------
     dict
         {
           "智能家居": [
-            {"name": "五金/工具", "category_id": "1000003462", "industry_id": "6"},
+            {"name": "五金/工具", "category_id": "1000001142", "industry_id": "7"},
             ...
           ],
           ...
         }
     """
-    logger.info("开始类目树自动发现（React fiber），目标 L1: %s", target_l1_names)
+    logger.info("开始类目树自动发现（React fiber），目标 L1: %s", target_l1_names or "（账号可见的全部）")
 
     # 确保级联选择器已展开（触发组件渲染）
     await _ensure_cascader_rendered(page)
+    # 尽力 hover 展开各目标 L1/L2，触发子级懒加载，避免只拿到首列数据
+    await _expand_target_columns(page, target_l1_names)
     await page.wait_for_timeout(1000)
 
     # 从 React fiber 提取完整数据
@@ -107,24 +144,27 @@ async def discover_categories(page: Page, target_l1_names: list[str]) -> dict:
 
     raw_options = result.get("options", [])
     logger.info("从 React fiber 提取到 %d 个一级类目", len(raw_options))
+    _dump_raw_tree(raw_options)
 
     target_set = set(target_l1_names)
+    discover_all = not target_set
     tree: dict[str, list[dict]] = {}
 
     for l1 in raw_options:
-        l1_name = l1.get("label") or l1.get("cate_name", "")
-        l1_id = l1.get("value") or l1.get("cate_id", "")
+        l1_name = _clean_label(l1)
+        l1_id = _node_id(l1)
 
-        if l1_name not in target_set:
+        if not discover_all and l1_name not in target_set:
             logger.debug("跳过 L1: %s (不在目标中)", l1_name)
             continue
 
-        l2_children = l1.get("children", [])
-        l2_list = []
-        for l2 in l2_children:
-            l2_name = l2.get("label") or l2.get("cate_name", "")
-            l2_id = l2.get("value") or l2.get("cate_id", "")
-            if not l2_name or not l2_id:
+        # 采集粒度 = 二级类目（L2）。选中 L2 后其下都有一个「全部」(value=0) 占位项，
+        # 选「全部」即代表该 L2 全部商品，因此 category_id 用 L2 自身 id（不是「全部」的 0）。
+        l2_list: list[dict] = []
+        for l2 in (l1.get("children") or []):
+            l2_name = _clean_label(l2)
+            l2_id = _node_id(l2)
+            if not l2_name or l2_name == _ALL_NODE_LABEL or not l2_id or l2_id == "0":
                 continue
             l2_list.append({
                 "name": l2_name,
@@ -138,10 +178,18 @@ async def discover_categories(page: Page, target_l1_names: list[str]) -> dict:
                         l1_name, l1_id, len(l2_list),
                         [c["name"] for c in l2_list])
         else:
-            logger.warning("  [%s]: 无二级类目", l1_name)
+            logger.warning("  [%s]: 无二级类目（可能子级未加载或账号无权限）", l1_name)
 
-    logger.info("类目树发现完成: %d 个 L1, 共 %d 个 L2",
+    logger.info("类目树发现完成: %d 个 L1, 共 %d 个二级类目",
                 len(tree), sum(len(v) for v in tree.values()))
+    if target_set:
+        missing = sorted(target_set - set(tree))
+        if missing:
+            logger.warning(
+                "目标一级类目未出现在当前账号的商品卡榜类目树中: %s；"
+                "可能是该账号无此类目权限、或类目名与平台不一致，已跳过（非致命）",
+                missing,
+            )
     return tree
 
 
@@ -167,11 +215,59 @@ async def _ensure_cascader_rendered(page: Page) -> None:
     logger.warning("级联选择器展开超时，继续尝试提取...")
 
 
-def load_category_tree(cache_path: str) -> Optional[dict]:
-    """从缓存文件加载类目树。"""
+async def _expand_target_columns(page: Page, target_l1_names: list[str]) -> None:
+    """
+    尽力 hover 展开每个目标 L1 及其 L2，触发级联子级懒加载，
+    让 React props 带上完整 children（否则只拿到当前选中 L1 的子级）。
+    任意步骤失败都不影响主流程——拿不到就按已加载的数据提取。
+
+    注：若实跑发现 L2/L3 仍不全，多半是 expandTrigger 为 click 而非 hover，
+    把下面的 .hover() 换成 .click() 即可（点击非叶子节点只是展开、不会选中）。
+    """
+    names = list(target_l1_names or [])
+    if not names:
+        return
+    try:
+        menus = page.locator(".ecom-cascader-menus")
+        for l1 in names:
+            l1_item = menus.locator(".ecom-cascader-menu-item", has_text=l1).first
+            try:
+                if await l1_item.count() == 0:
+                    continue
+                await l1_item.hover(timeout=3000)
+                await page.wait_for_timeout(400)
+            except Exception:
+                continue
+            # 展开后最后一列是该 L1 的 L2，逐个 hover 触发 L3 懒加载
+            columns = menus.locator(".ecom-cascader-menu")
+            col_count = await columns.count()
+            if col_count < 2:
+                continue
+            l2_items = columns.nth(col_count - 1).locator(".ecom-cascader-menu-item")
+            n = await l2_items.count()
+            for i in range(n):
+                try:
+                    await l2_items.nth(i).hover(timeout=2000)
+                    await page.wait_for_timeout(250)
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.warning("级联展开（懒加载触发）未完全成功，按已加载数据提取: %s", e)
+
+
+# 类目缓存 TTL（秒），默认 7 天
+_CATEGORY_CACHE_TTL_SECONDS = 7 * 24 * 3600
+
+
+def load_category_tree(cache_path: str, ttl: int = _CATEGORY_CACHE_TTL_SECONDS) -> Optional[dict]:
+    """从缓存文件加载类目树，超过 TTL 则视为过期。"""
     if not os.path.exists(cache_path):
         return None
     try:
+        age = time.time() - os.path.getmtime(cache_path)
+        if age > ttl:
+            logger.info("类目树缓存已过期（%.1f 天），将重新发现", age / 86400)
+            return None
         with open(cache_path, "r", encoding="utf-8") as f:
             tree = json.load(f)
         logger.info("从缓存加载类目树: %s (%d 个 L1, 共 %d 个 L2)",

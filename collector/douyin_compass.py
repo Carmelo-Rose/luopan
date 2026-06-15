@@ -8,6 +8,7 @@
   - 翻页方式：直接调用接口 page_no 参数（不点击翻页按钮），每页拦截一次响应
 """
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -16,18 +17,15 @@ from typing import Optional
 from urllib.parse import urlencode, urlparse, parse_qs, parse_qsl, urlunparse
 
 from playwright.async_api import (
-    async_playwright, Page, BrowserContext, Response
+    async_playwright, Page, BrowserContext, Response, Error as PlaywrightError
 )
 
 from config import settings
 
 logger = logging.getLogger(__name__)
 
-# ── 真实榜单入口 URL ───────────────────────────────────────────────────
-_RANK_ENTRY_URL = (
-    "https://compass.jinritemai.com/shop/chance/merchandise-product-rank"
-    "?rank_type=3"
-)
+# ── 真实榜单入口 URL（从 settings 读取）────────────────────────────────
+_RANK_ENTRY_URL = settings.RANK_ENTRY_URL
 
 # ── 数据接口路径关键词 ─────────────────────────────────────────────────
 _API_PATH = "product_card_hot_v2"
@@ -35,6 +33,24 @@ _API_PATH = "product_card_hot_v2"
 
 def _is_rank_api(url: str) -> bool:
     return _API_PATH in url
+
+
+# 浏览器自管理的请求头，fetch 时不应手动设置
+_BROWSER_MANAGED_HEADERS = frozenset({
+    "cookie", "host", "connection", "accept-encoding",
+    "content-length", "content-type", "referer", "origin",
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+    "user-agent", "upgrade-insecure-requests",
+})
+
+
+def _extract_forwardable_headers(headers: dict) -> dict:
+    """从拦截的请求头中提取可复用的反爬头（排除浏览器自管理的头）。"""
+    return {
+        k: v for k, v in headers.items()
+        if k.lower() not in _BROWSER_MANAGED_HEADERS
+    }
 
 
 # ── 分页参数识别 ───────────────────────────────────────────────────────
@@ -70,11 +86,22 @@ def _build_paged_url(original_url: str, page_no: int, page_param: Optional[str])
 
 
 def _apply_query_overrides(url: str, overrides: dict[str, str]) -> str:
-    """替换或追加 query 参数，空值不参与覆盖。"""
+    """替换或追加 query 参数，空值不参与覆盖。保持原始参数顺序。"""
     parsed = urlparse(url)
-    params = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    params.update({key: value for key, value in overrides.items() if value})
-    return urlunparse(parsed._replace(query=urlencode(params)))
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    active = {k: v for k, v in overrides.items() if v}
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for key, value in pairs:
+        if key in active:
+            result.append((key, active[key]))
+            seen.add(key)
+        else:
+            result.append((key, value))
+    for key, value in overrides.items():
+        if value and key not in seen:
+            result.append((key, value))
+    return urlunparse(parsed._replace(query=urlencode(result)))
 
 
 # ── 字段解析 ──────────────────────────────────────────────────────────
@@ -137,24 +164,6 @@ def _parse_card(
     }
 
 
-async def _parse_api_body(
-    body: bytes, page_no: int, page_size: int, scope_key: str, captured_at: str,
-    industry_name: str = "", category_name: str = "",
-) -> list[dict]:
-    """解析接口响应体，返回本页商品列表。"""
-    try:
-        data = json.loads(body)
-    except Exception:
-        return []
-
-    card_list = data.get("data", {}).get("card_list", [])
-    if not isinstance(card_list, list) or not card_list:
-        return []
-    return _parse_card_list(
-        card_list, page_no, page_size, scope_key, captured_at,
-        industry_name=industry_name, category_name=category_name,
-    )
-
 
 def _parse_card_list(
     card_list: list, page_no: int, page_size: int, scope_key: str, captured_at: str,
@@ -176,6 +185,61 @@ def _parse_card_list(
 
 # ── DOM 降级解析（备用） ───────────────────────────────────────────────
 
+# 表头关键字 → 逻辑字段名映射；无法匹配时回退到硬编码默认顺序。
+_DOM_COLUMN_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("product_title", ("商品", "商品名称", "商品标题")),
+    ("shop_info", ("店铺", "商家", "店铺信息")),
+    ("pay_amount", ("支付金额", "销售额", "成交金额", "GMV")),
+    ("clicks", ("点击", "点击次数", "曝光")),
+    ("conversion_rate", ("转化率", "点击转化")),
+    ("card_order_count", ("成交件数", "成交单数", "订单数", "销量")),
+]
+
+# 回退：表头无法识别时的默认列索引（排名 | 商品信息 | 店铺信息 | 支付金额 | 点击次数 | 转化率 | 成交件数 | 操作）
+_DOM_DEFAULT_COL_MAP = {
+    "product_title": 1,
+    "shop_info": 2,
+    "pay_amount": 3,
+    "clicks": 4,
+    "conversion_rate": 5,
+    "card_order_count": 6,
+}
+
+
+async def _build_dom_column_map(header_rows: list) -> dict[str, Optional[int]]:
+    """从 <th> 表头动态识别列索引，识别失败则回退默认映射。"""
+    if not header_rows:
+        return dict(_DOM_DEFAULT_COL_MAP)
+
+    headers: list[str] = []
+    for row in header_rows:
+        ths = await row.query_selector_all("th")
+        headers = [(await th.inner_text()).strip() for th in ths]
+        if headers:
+            break
+
+    col_map: dict[str, Optional[int]] = {}
+    for field, keywords in _DOM_COLUMN_KEYWORDS:
+        idx = next(
+            (i for i, h in enumerate(headers) if any(kw in h for kw in keywords)),
+            None,
+        )
+        col_map[field] = idx
+
+    matched = sum(1 for v in col_map.values() if v is not None)
+    if matched < len(_DOM_COLUMN_KEYWORDS) / 2:
+        logger.warning(
+            "DOM 表头列映射识别不足（%d/%d），回退默认顺序。headers=%s",
+            matched, len(_DOM_COLUMN_KEYWORDS), headers,
+        )
+        return dict(_DOM_DEFAULT_COL_MAP)
+
+    for field in col_map:
+        if col_map[field] is None:
+            col_map[field] = _DOM_DEFAULT_COL_MAP.get(field)
+    return col_map
+
+
 async def _parse_dom_rows(
     page: Page, page_no: int, page_size: int, scope_key: str, captured_at: str,
     industry_name: str = "", category_name: str = "",
@@ -186,12 +250,16 @@ async def _parse_dom_rows(
     """
     try:
         await page.wait_for_selector("tr", timeout=10000)
+    except PlaywrightError:
+        raise
     except Exception:
         return []
 
     rows = await page.query_selector_all("tr")
-    # 跳过表头行
+    header_rows = [r for r in rows if await r.query_selector("th")]
     data_rows = [r for r in rows if await r.query_selector("td")]
+
+    col_map = await _build_dom_column_map(header_rows)
 
     start_rank = (page_no - 1) * page_size + 1
     products = []
@@ -207,14 +275,18 @@ async def _parse_dom_rows(
         link_el = await row.query_selector("a[href*='jinritemai']")
         url = await link_el.get_attribute("href") if link_el else ""
         pid_match = re.search(r"id=(\d+)", url)
-        product_id = pid_match.group(1) if pid_match else f"dom_{page_no}_{i}"
+        product_title = texts[col_map["product_title"]] if col_map.get("product_title") is not None and col_map["product_title"] < len(texts) else ""
+        shop_info = texts[col_map["shop_info"]] if col_map.get("shop_info") is not None and col_map["shop_info"] < len(texts) else ""
+        if pid_match:
+            product_id = pid_match.group(1)
+        else:
+            seed = f"{product_title}_{shop_info}".strip("_")
+            product_id = "dom_" + hashlib.md5(seed.encode()).hexdigest()[:12]
 
-        # texts 列顺序：排名 | 商品信息(含标题) | 店铺信息 | 支付金额 | 点击次数 | 转化率 | 成交件数 | 操作
-        product_title = texts[1] if len(texts) > 1 else ""
-        pay_amount = texts[3] if len(texts) > 3 else ""
-        clicks = texts[4] if len(texts) > 4 else ""
-        conversion_rate = texts[5] if len(texts) > 5 else ""
-        card_order_count = texts[6] if len(texts) > 6 else ""
+        pay_amount = texts[col_map["pay_amount"]] if col_map.get("pay_amount") is not None and col_map["pay_amount"] < len(texts) else ""
+        clicks = texts[col_map["clicks"]] if col_map.get("clicks") is not None and col_map["clicks"] < len(texts) else ""
+        conversion_rate = texts[col_map["conversion_rate"]] if col_map.get("conversion_rate") is not None and col_map["conversion_rate"] < len(texts) else ""
+        card_order_count = texts[col_map["card_order_count"]] if col_map.get("card_order_count") is not None and col_map["card_order_count"] < len(texts) else ""
 
         products.append({
             "rank": rank,
@@ -258,8 +330,8 @@ class DouyinCompassCollector:
         self.user_data_dir = user_data_dir or settings.BROWSER_USER_DATA_DIR
         self.channel = channel or settings.BROWSER_CHANNEL
         self.rank_url = rank_url or _RANK_ENTRY_URL
-        self.total_pages = total_pages or settings.TOTAL_PAGES
-        self.page_size = page_size or settings.PAGE_SIZE
+        self.total_pages = total_pages if total_pages is not None else settings.TOTAL_PAGES
+        self.page_size = page_size if page_size is not None else settings.PAGE_SIZE
         self.headless = headless
 
         self._playwright = None
@@ -269,6 +341,8 @@ class DouyinCompassCollector:
         # 缓存首页的请求参数（从拦截的 URL 中提取），用于后续翻页
         self._base_api_params: dict = {}
         self._base_api_url: str = ""
+        # 从拦截到的首个 API 请求中提取的可复用请求头（反爬头）
+        self._captured_headers: dict = {}
 
     async def __aenter__(self):
         self._playwright = await async_playwright().start()
@@ -323,7 +397,7 @@ class DouyinCompassCollector:
         _reuse_page : bool
             True = 跳过 goto 导航（多类目采集时复用已有页面）
         """
-        captured_at = datetime.now(timezone.utc).isoformat()
+        captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         page = self._page
         all_products: list[dict] = []
         collection_failed = False
@@ -350,6 +424,10 @@ class DouyinCompassCollector:
             )
         all_products.extend(page1_products)
         logger.info("第 1/%d 页采集 %d 条", self.total_pages, len(page1_products))
+
+        if captured_url and not self._base_api_url:
+            self._base_api_url = captured_url
+            logger.debug("缓存 base API URL: %s", captured_url[:120])
 
         if not captured_url:
             logger.error("未能捕获 API URL，无法继续翻页，本轮采集判为不完整")
@@ -475,37 +553,93 @@ class DouyinCompassCollector:
         返回 (商品列表, 实时 API URL)。
         """
         captured_url: str = ""
+        captured_headers: dict = {}
+        has_cached_base = bool(self._base_api_url)
 
         async def on_response(resp: Response):
-            nonlocal captured_url
+            nonlocal captured_url, captured_headers
             if _is_rank_api(resp.url) and resp.status == 200 and not captured_url:
+                try:
+                    body = await resp.json()
+                except Exception:
+                    return
+                card_list = body.get("data", {}).get("card_list", [])
+                if not isinstance(card_list, list) or not card_list:
+                    logger.debug("跳过空/无效响应（无 card_list）: %s", resp.url)
+                    return
                 captured_url = resp.url
-                logger.debug("捕获初始 API URL: %s", captured_url)
+                try:
+                    captured_headers = _extract_forwardable_headers(
+                        resp.request.headers
+                    )
+                except Exception:
+                    captured_headers = {}
+                logger.debug(
+                    "捕获初始 API URL（%d 条数据）: %s", len(card_list), captured_url
+                )
+
+        # 构造目标 URL
+        nav_url = self.rank_url
+        if _reuse_page:
+            ind_id = industry_id or settings.INDUSTRY_ID
+            cat_id = category_id or settings.CATEGORY_ID
+            if ind_id and cat_id:
+                nav_url = _apply_query_overrides(
+                    self.rank_url,
+                    {"industry_id": ind_id, "category_id": cat_id},
+                )
 
         page.on("response", on_response)
         try:
             if not _reuse_page:
                 logger.info("导航至榜单页: %s", self.rank_url)
                 await page.goto(self.rank_url, wait_until="domcontentloaded", timeout=60000)
+                # 首次加载：等待 SPA 自动触发 API（最多 20s）
+                for _ in range(40):
+                    if captured_url:
+                        break
+                    await asyncio.sleep(0.5)
             else:
-                # 复用页面：通过 JS 触发一次新的 API 请求以捕获 URL
-                await page.reload(wait_until="domcontentloaded", timeout=60000)
-            for _ in range(40):
-                if captured_url:
-                    break
-                await asyncio.sleep(0.5)
+                logger.info("切换类目，导航至: %s", nav_url)
+                await page.goto(nav_url, wait_until="domcontentloaded", timeout=60000)
+                if has_cached_base:
+                    # 已有 base URL，SPA 可能不重新触发 API，短等后直接用 fetch
+                    logger.info("已有缓存 API URL，短等 3s 后尝试手动 fetch")
+                    for _ in range(6):
+                        if captured_url:
+                            break
+                        await asyncio.sleep(0.5)
+                    if not captured_url:
+                        logger.info("SPA 未触发新 API 请求，将使用缓存 base URL + fetch")
+                else:
+                    # 无缓存（理论上不会发生，idx>1 时至少 idx=1 已缓存）
+                    for _ in range(40):
+                        if captured_url:
+                            break
+                        await asyncio.sleep(0.5)
         finally:
             page.remove_listener("response", on_response)
 
-        if not captured_url:
-            return [], ""
+        if captured_headers:
+            self._captured_headers = captured_headers
+            logger.debug("已缓存 %d 个请求头用于翻页", len(captured_headers))
 
-        # 覆盖类目参数
         ind_id = industry_id or settings.INDUSTRY_ID
         cat_id = category_id or settings.CATEGORY_ID
 
+        # 选择 URL 来源：优先本次拦截，否则回退到缓存
+        url_source = captured_url or self._base_api_url
+        if not url_source:
+            return [], ""
+
+        if not captured_url and self._base_api_url:
+            logger.info("复用缓存 base API URL 构造新类目请求")
+            if not captured_headers:
+                captured_headers = dict(self._captured_headers)
+
+        # 覆盖类目参数（使用本次拦截的 URL 或缓存的 base URL）
         realtime_url = _apply_query_overrides(
-            captured_url,
+            url_source,
             {
                 "date_type": "1",
                 "industry_id": ind_id,
@@ -548,18 +682,22 @@ class DouyinCompassCollector:
         paged_url = _build_paged_url(original_url, page_no, page_param)
         logger.debug("第 %d 页请求 URL: %s", page_no, paged_url)
 
+        # 合并缓存的反爬头与基础 Accept 头
+        fetch_headers = {"Accept": "application/json, text/plain, */*"}
+        fetch_headers.update(self._captured_headers)
+
         try:
             result = await page.evaluate(
-                """async (url) => {
+                """async ([url, headers]) => {
                     const resp = await fetch(url, {
                         method: 'GET',
                         credentials: 'include',
-                        headers: { 'Accept': 'application/json, text/plain, */*' }
+                        headers: headers
                     });
                     const text = await resp.text();
                     return { ok: resp.ok, status: resp.status, text };
                 }""",
-                paged_url,
+                [paged_url, fetch_headers],
             )
         except Exception as exc:
             logger.error("第 %d 页 fetch 异常: %s", page_no, exc)
@@ -578,6 +716,16 @@ class DouyinCompassCollector:
                 page_no, result.get("status"),
             )
             return None
+
+        # 检查业务级错误码（status_code、code、err_no 等）
+        for err_key in ("status_code", "code", "err_no", "errno"):
+            if err_key in data and data[err_key] != 0:
+                logger.error(
+                    "第 %d 页 API 业务错误: %s=%s, msg=%s",
+                    page_no, err_key, data[err_key],
+                    data.get("msg", data.get("message", data.get("status_msg", "")))
+                )
+                return None
 
         card_list = data.get("data", {}).get("card_list", [])
         if not isinstance(card_list, list):
@@ -598,4 +746,12 @@ def collect_sync(scope_key: str = "card_order", **kwargs) -> list[dict]:
     async def _run():
         async with DouyinCompassCollector(**kwargs) as c:
             return await c.collect(scope_key=scope_key)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        import nest_asyncio
+        nest_asyncio.apply()
+        return loop.run_until_complete(_run())
     return asyncio.run(_run())

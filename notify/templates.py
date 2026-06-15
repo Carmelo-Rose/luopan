@@ -10,6 +10,7 @@
 GROUPS 须覆盖 monitor/diff.py 全部事件类型，否则 group_events() 打 WARNING。
 """
 import logging
+import re
 from datetime import datetime
 
 from monitor.diff import (
@@ -25,6 +26,14 @@ from monitor.diff import (
 logger = logging.getLogger(__name__)
 
 _TITLE_MAXLEN = 60
+
+_MARKDOWN_SPECIAL = re.compile(r'([\\*_`\[\]#~>|])')
+
+
+def _escape_markdown(text: str) -> str:
+    """转义企微 markdown 中的特殊字符。"""
+    return _MARKDOWN_SPECIAL.sub(r'\\\1', text)
+
 
 GROUPS: list[tuple[str, set]] = [
     ("🚨 重磅异动",   {ENTER_TOP10, RANK_UP_50_PLUS_WARNING}),
@@ -70,7 +79,7 @@ def format_line(event: dict, link: bool = True) -> str:
       新进榜：商品标题  #116（新进榜）(五金)
     """
     etype = event.get("event_type", "")
-    title = _trim(event.get("product_title", ""))
+    title = _escape_markdown(_trim(event.get("product_title", "")))
     rank_cur = event.get("rank_current")
     rank_prev = event.get("rank_previous")
     delta = event.get("rank_delta")
