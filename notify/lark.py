@@ -40,7 +40,13 @@ _BASE_FIELDS = [
 ]
 
 _CST = timezone(timedelta(hours=8))
-_BASE_BATCH = 200  # 飞书 record-batch-create 单批上限
+_BASE_BATCH = 200  # 飞书 record-batch-create / record-delete 单批上限
+
+# 飞书 Base 写入模式：
+#   "overwrite" —— 每轮写入前先清空整表，Base 始终只保留「最新一轮」异动（当前启用）。
+#   "append"    —— 不清空，直接追加，保留全部历史轮次（旧的叠加行为）。
+# 想恢复叠加：把下面改回 "append" 即可，其余代码无需改动。
+_BASE_WRITE_MODE = "overwrite"
 
 
 def _round_label(run_id: str) -> str:
@@ -115,10 +121,114 @@ def _lark_batch_create(rows: list[list]) -> bool:
                 pass
 
 
+def _lark_list_all_record_ids() -> list[str]:
+    """列出整表全部 record_id（按 _BASE_BATCH 分页直到 has_more=false）。
+
+    失败时返回已取到的部分（调用方据「取到数 vs 实删数」判断是否清空干净）。
+    """
+    ids: list[str] = []
+    offset = 0
+    env = {**os.environ, "LARK_CLI_NO_PROXY": "1"}
+    while True:
+        cmd = (
+            f'lark-cli base +record-list '
+            f'--base-token {settings.LARK_BASE_APP_TOKEN} '
+            f'--table-id {settings.LARK_TABLE_ID} '
+            f'--limit {_BASE_BATCH} --offset {offset} '
+            f'--format json --as {settings.LARK_AS}'
+        )
+        try:
+            proc = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                encoding="utf-8", errors="ignore", env=env, timeout=60,
+            )
+            out = (proc.stdout or "") + (proc.stderr or "")
+            m = re.search(r"\{.*\}", out, re.S)
+            if not m:
+                logger.error("飞书 Base 列举记录无可解析响应: %s", out[:200])
+                break
+            data = json.loads(m.group(0))
+            if not data.get("ok"):
+                logger.error("飞书 Base 列举记录失败: %s",
+                             json.dumps(data.get("error", {}), ensure_ascii=False)[:300])
+                break
+        except Exception as exc:
+            logger.error("飞书 Base 列举记录异常: %s", exc)
+            break
+
+        d = data.get("data", {}) or {}
+        page_ids = d.get("record_id_list") or []
+        ids.extend(page_ids)
+        if not page_ids or not d.get("has_more"):
+            break
+        offset += _BASE_BATCH
+    return ids
+
+
+def _lark_delete_records(ids: list[str]) -> int:
+    """按 _BASE_BATCH 分批删除给定 record_id，返回成功删除数。遇首个失败批即停。"""
+    if not ids:
+        return 0
+    deleted = 0
+    cwd = os.getcwd()
+    env = {**os.environ, "LARK_CLI_NO_PROXY": "1"}
+    for i in range(0, len(ids), _BASE_BATCH):
+        batch = ids[i:i + _BASE_BATCH]
+        tmp = None
+        try:
+            # 与 create 一致：record_id 虽是 ASCII，仍走临时文件 @file，规避命令行引号问题
+            fd, tmp = tempfile.mkstemp(suffix=".json", prefix="lark_del_", dir=cwd)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"record_id_list": batch}, f, ensure_ascii=False)
+            rel = os.path.basename(tmp)
+            cmd = (
+                f'lark-cli base +record-delete '
+                f'--base-token {settings.LARK_BASE_APP_TOKEN} '
+                f'--table-id {settings.LARK_TABLE_ID} '
+                f'--json @"{rel}" --yes --as {settings.LARK_AS}'
+            )
+            proc = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                encoding="utf-8", errors="ignore", env=env, timeout=60, cwd=cwd,
+            )
+            out = (proc.stdout or "") + (proc.stderr or "")
+            m = re.search(r"\{.*\}", out, re.S)
+            if not m or not json.loads(m.group(0)).get("ok"):
+                logger.error("飞书 Base 删除批次失败: %s", out[:200])
+                break
+            deleted += len(batch)
+        except Exception as exc:
+            logger.error("飞书 Base 删除记录异常: %s", exc)
+            break
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    return deleted
+
+
+def _clear_base_table() -> bool:
+    """清空飞书 Base 整表（覆盖模式写入前调用）。全部删除成功（或本就为空）返回 True。"""
+    ids = _lark_list_all_record_ids()
+    if not ids:
+        logger.info("飞书 Base 当前无记录，无需清空")
+        return True
+    deleted = _lark_delete_records(ids)
+    ok = deleted == len(ids)
+    logger.info("飞书 Base 清空: 删除 %d/%d 条%s",
+                deleted, len(ids), "" if ok else "（未全部删除）")
+    return ok
+
+
 def sync_events_to_base(events: list[dict], run_id: str) -> int:
     """
-    把一轮全部异动事件追加写入飞书多维表格（按 _BASE_BATCH 分批）。
+    把一轮全部异动事件写入飞书多维表格（按 _BASE_BATCH 分批）。
 
+    写入模式由 _BASE_WRITE_MODE 决定：
+      - "overwrite"（默认）：写入前先清空整表，Base 只保留最新一轮。
+      - "append"：不清空，直接追加，保留全部历史轮次。
     返回成功写入的事件条数；遇首个失败批立即停止并返回此前已写入数（便于排障，
     不做幂等去重——每轮 run_id 唯一、事件已在 DB 层去重，正常流程不会重复写）。
     未配置 LARK_BASE_APP_TOKEN / LARK_TABLE_ID 时跳过（返回 0）。
@@ -129,8 +239,15 @@ def sync_events_to_base(events: list[dict], run_id: str) -> int:
         logger.info("未配置 LARK_BASE_APP_TOKEN / LARK_TABLE_ID，跳过飞书 Base 同步")
         return 0
 
-    round_label = _round_label(run_id)
-    rows = [_event_to_row(e, round_label) for e in events]
+    # 每行按事件自身 run_id 打轮次标签（events 可能跨两轮——含上一轮补发的残留），
+    # 缺失时回退到本轮 run_id。
+    rows = [_event_to_row(e, _round_label(e.get("run_id") or run_id)) for e in events]
+
+    # ── 覆盖模式：写入前清空整表，使 Base 只保留最新一轮 ──────────────
+    # append 模式跳过这步，下面的批量新建即为旧的「叠加追加」行为。
+    if _BASE_WRITE_MODE == "overwrite":
+        if not _clear_base_table():
+            logger.warning("飞书 Base 清空未完全成功，仍继续写入本轮（可能与残留旧数据并存）")
 
     written = 0
     for i in range(0, len(rows), _BASE_BATCH):

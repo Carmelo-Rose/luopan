@@ -125,6 +125,19 @@ def get_all_run_ids(conn: sqlite3.Connection, scope_key: str) -> list[str]:
     return [r["run_id"] for r in rows]
 
 
+def get_latest_run_ids(conn: sqlite3.Connection, limit: int = 2) -> list[str]:
+    """返回全局（跨 scope）最近 limit 个 run_id，降序。
+
+    用于「中断恢复」：把待推送范围限定在最近一两轮，这样上一轮被硬杀
+    （未走到推送/同步）的事件能在本轮补发，又不会把更早的历史残留一起翻出来。
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT run_id FROM products_snapshot ORDER BY run_id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [r["run_id"] for r in rows]
+
+
 # ── 事件写入 ──────────────────────────────────────────────────────────
 
 def insert_events(conn: sqlite3.Connection, events: list[dict]) -> int:

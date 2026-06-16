@@ -307,7 +307,9 @@ async def run_multi(
                     logger.info("[%s] 差分: %d 条事件", scope_key, len(events))
 
                     if events:
-                        database.insert_events(conn, events)
+                        # dry-run 不落库（遵守「不写 notified」契约，避免留下永不送达的残留事件）
+                        if not dry_run:
+                            database.insert_events(conn, events)
                         all_events.extend(events)
                     category_results.append({
                         "industry_name": ind_name, "category_name": cat_name,
@@ -357,7 +359,8 @@ async def run_multi(
                 logger.info("[%s] 差分: %d 条事件", scope_key, len(events))
 
                 if events:
-                    database.insert_events(conn, events)
+                    if not dry_run:
+                        database.insert_events(conn, events)
                     all_events.extend(events)
                 category_results.append({
                     "industry_name": ind_name, "category_name": cat_name,
@@ -365,16 +368,12 @@ async def run_multi(
                     "products": cat_total, "events": len(events),
                 })
 
-        # ── 生成 Excel 报告（dry-run 不产生副作用）──────────────────
+        # ── 推送 + 同步 ──────────────────────────────────────────
+        # 关键：以「数据库里仍待送达的事件」为准，而非仅本进程内存中的 all_events。
+        # 推送/同步排在整轮采集之后，若上一轮在中途被硬杀（没走到这一步），其已落库的
+        # 事件会在本轮一并补发，做到「跑完即补齐」。范围限定最近两轮（get_latest_run_ids），
+        # 避免把更早的历史残留也一起翻出来重推。
         excel_path = ""
-        if not dry_run:
-            report_dir = os.path.join(settings.BASE_DIR, "data", "reports")
-            excel_path = generate_report(
-                all_events, report_dir, timestamp=ts,
-                category_results=category_results,
-            )
-
-        # ── 企微摘要推送 ─────────────────────────────────────────
         if dry_run:
             logger.info("[DRY-RUN] 跳过推送，共 %d 条事件", len(all_events))
             for e in all_events[:10]:
@@ -383,16 +382,31 @@ async def run_multi(
                             e.get("category_name", ""), e["rank_current"],
                             e["product_title"][:30])
         else:
-            _dispatch_summary(
-                conn, all_events, categories_collected, excel_path, ts,
+            recent_runs = set(database.get_latest_run_ids(conn, 2))
+            to_send = [
+                e for e in database.get_pending_events(conn)
+                if e.get("run_id") in recent_runs
+            ]
+            backlog = len(to_send) - len(all_events)
+            if backlog > 0:
+                logger.info("检测到上一轮未送达事件 %d 条，本轮一并补发", backlog)
+
+            report_dir = os.path.join(settings.BASE_DIR, "data", "reports")
+            excel_path = generate_report(
+                to_send, report_dir, timestamp=ts,
                 category_results=category_results,
             )
 
-        # ── 飞书多维表格同步（独立于企微通知，配齐 token 才执行）──────
-        if not dry_run and all_events and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
-            from notify.lark import sync_events_to_base
-            written = sync_events_to_base(all_events, run_id)
-            logger.info("飞书 Base 同步: 写入 %d / %d 条事件", written, len(all_events))
+            _dispatch_summary(
+                conn, to_send, categories_collected, excel_path, ts,
+                category_results=category_results,
+            )
+
+            # ── 飞书多维表格同步（独立于企微通知，配齐 token 才执行）──────
+            if to_send and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
+                from notify.lark import sync_events_to_base
+                written = sync_events_to_base(to_send, run_id)
+                logger.info("飞书 Base 同步: 写入 %d / %d 条事件", written, len(to_send))
 
         logger.info(
             "═══ 多类目采集完成 | %d 个类目 | %d 条商品 | %d 条事件 | baseline=%d ═══",
@@ -556,14 +570,11 @@ def _dispatch_summary(
         logger.warning("摘要或 Excel 未完整送达，本轮事件保留为待通知")
         return
 
-    current_run_ids = {e.get("run_id") for e in events if e.get("run_id")}
-    current_ids = [
-        e["id"] for e in database.get_pending_events(conn)
-        if e.get("run_id") in current_run_ids and e.get("id") is not None
-    ]
-    if current_ids:
-        database.mark_events_notified(conn, current_ids)
-        logger.info("摘要模式: 标记本轮 %d 条事件为已通知", len(current_ids))
+    # 只标记本次实际推送的这批事件（含补发的上一轮残留），失败的留待下轮重试
+    ids = [e["id"] for e in events if e.get("id") is not None]
+    if ids:
+        database.mark_events_notified(conn, ids)
+        logger.info("摘要模式: 标记 %d 条事件为已通知", len(ids))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────
