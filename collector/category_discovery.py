@@ -103,9 +103,25 @@ def _raw_dump_path() -> str:
 
 
 def _dump_raw_tree(raw_options: list) -> None:
-    """把提取到的完整原始类目树（含各级 children/isLeaf）落盘，便于离线核对结构。"""
+    """把提取到的完整原始类目树（含各级 children/isLeaf）落盘，便于离线核对结构。
+
+    防退化：补充发现（只查个别缺失 L1）有时只提取到部分 L1，若直接覆盖会把完整
+    dump 砍小。故当本次 L1 数 < 现有 dump 的 L1 数时跳过覆盖，保留更完整的版本。
+    """
     try:
         dump_path = _raw_dump_path()
+        if os.path.exists(dump_path):
+            try:
+                with open(dump_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if isinstance(existing, list) and len(raw_options) < len(existing):
+                    logger.warning(
+                        "本次原始类目树仅 %d 个 L1 < 现有 dump %d 个，疑似部分发现，跳过覆盖",
+                        len(raw_options), len(existing),
+                    )
+                    return
+            except Exception:
+                pass
         os.makedirs(os.path.dirname(dump_path), exist_ok=True)
         with open(dump_path, "w", encoding="utf-8") as f:
             json.dump(raw_options, f, ensure_ascii=False, indent=2)
@@ -237,10 +253,17 @@ async def discover_categories(page: Page, target_l1_names: list[str]) -> dict:
 
     # 同步刷新「id→三级/叶子类目名」拍平索引（采集器据此翻译商品 leaf_category_id）。
     # 注意：采集粒度虽是 L2，但索引覆盖全树各层，供商品叶子类目反查。
+    # 防退化：补充发现可能只提取到部分树，若拍平条数比现有少则跳过覆盖，避免砍小索引。
     try:
-        save_category_lookup(
-            settings.CATEGORY_LOOKUP_CACHE, flatten_category_lookup(raw_options)
-        )
+        new_lookup = flatten_category_lookup(raw_options)
+        existing = load_category_lookup(settings.CATEGORY_LOOKUP_CACHE) or {}
+        if len(new_lookup) >= len(existing):
+            save_category_lookup(settings.CATEGORY_LOOKUP_CACHE, new_lookup)
+        else:
+            logger.warning(
+                "本次拍平索引 %d 条 < 现有 %d 条，疑似部分发现，保留现有索引不覆盖",
+                len(new_lookup), len(existing),
+            )
     except Exception as e:
         logger.warning("构建类目拍平索引失败（非致命）: %s", e)
 
