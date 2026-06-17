@@ -386,6 +386,44 @@ class DouyinCompassCollector:
             if self._playwright:
                 await self._playwright.stop()
 
+    async def _ensure_browser_alive(self) -> None:
+        """确保 page/context 仍存活；若已被关闭（崩溃 / 被风控关闭 / 某类目翻页时
+        触发 "Target page, context or browser has been closed"），重启持久化上下文。
+
+        多类目采集共享同一个 self._page：任何一类把页面搞死后，后续类目会因复用
+        死页面而连环失败。每个类目开采前调用本方法即可把故障隔离在单个类目内。
+        """
+        try:
+            if self._page is not None and not self._page.is_closed():
+                return  # 页面还活着，happy path 直接返回
+        except Exception:
+            pass  # 探测本身抛错 → 视为已死，走重启
+
+        logger.warning("检测到浏览器/页面已关闭，重启持久化上下文以恢复采集...")
+        try:
+            if self._context:
+                await self._context.close()
+        except Exception:
+            pass  # 已崩溃的上下文 close 可能抛错，忽略
+        self._context = await self._playwright.chromium.launch_persistent_context(
+            user_data_dir=self.user_data_dir,
+            channel=self.channel if self.channel != "chromium" else None,
+            headless=self.headless,
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_https_errors=True,
+        )
+        self._page = (
+            self._context.pages[0]
+            if self._context.pages
+            else await self._context.new_page()
+        )
+        # 旧会话缓存的 API URL / 反爬头来自已死的上下文，清掉，使恢复后的类目
+        # 走完整导航重新捕获（_collect_page1 在无缓存时会等 20s 让 SPA 触发 API）。
+        self._base_api_url = ""
+        self._base_api_params = {}
+        self._captured_headers = {}
+        logger.info("浏览器上下文已重启，继续采集")
+
     async def collect(
         self,
         scope_key: str = "card_order",
@@ -412,6 +450,8 @@ class DouyinCompassCollector:
             True = 跳过 goto 导航（多类目采集时复用已有页面）
         """
         captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 开采前自愈：若上一类目把共享页面搞死了，这里重启上下文，避免连环失败
+        await self._ensure_browser_alive()
         page = self._page
         all_products: list[dict] = []
         collection_failed = False
