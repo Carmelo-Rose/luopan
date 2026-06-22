@@ -398,7 +398,7 @@ async def run_multi(
             )
 
             _dispatch_summary(
-                conn, to_send, categories_collected, excel_path, ts,
+                conn, to_send, categories_collected, ts,
                 category_results=category_results,
             )
 
@@ -407,6 +407,16 @@ async def run_multi(
                 from notify.lark import sync_events_to_base
                 written = sync_events_to_base(to_send, run_id)
                 logger.info("飞书 Base 同步: 写入 %d / %d 条事件", written, len(to_send))
+
+            # ── 企微智能表格同步（通过 wecom-cli，配齐 docid+sheet_id 即启用）──
+            # 注意：不依赖 to_send，即使无新事件也同步最新数据到智能表格
+            if settings.WECOM_SMARTSHEET_DOCID and settings.WECOM_SMARTSHEET_SHEET_ID:
+                from notify.wecom_smartsheet import sync_to_smartsheet
+                # 使用 all_events（本轮采集的所有事件）而非 to_send（待推送事件）
+                sm_events = all_events if all_events else to_send
+                written_sm = sync_to_smartsheet(sm_events, run_id)
+                if written_sm:
+                    logger.info("企微智能表格同步: 写入 %d 条事件", written_sm)
 
         logger.info(
             "═══ 多类目采集完成 | %d 个类目 | %d 条商品 | %d 条事件 | baseline=%d ═══",
@@ -552,18 +562,27 @@ def _dispatch_events(conn, events: list[dict], scope_key: str) -> None:
 
 def _dispatch_summary(
     conn, events: list[dict], cat_count: int,
-    excel_path: str, ts: datetime,
+    ts: datetime,
     category_results: list[dict] | None = None,
 ) -> None:
-    """多类目模式：只推送企微摘要 + Excel 报告，不逐条推送事件。"""
+    """多类目模式：只推送企微摘要（含在线表格链接），不逐条推送事件。"""
     from notify.wecom import send_summary
+
+    # 构建在线表格链接
+    lark_url = ""
+    if settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
+        lark_url = f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}?table={settings.LARK_TABLE_ID}"
+
+    wecom_sheet_url = settings.WECOM_SMARTSHEET_URL
+
     delivered = send_summary(
         settings.WECOM_WEBHOOK_URL,
         events=events,
         categories_count=cat_count,
-        excel_path=excel_path,
         timestamp=ts,
         category_results=category_results,
+        lark_url=lark_url,
+        wecom_sheet_url=wecom_sheet_url,
     )
 
     if not delivered:
@@ -615,6 +634,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-runs", action="store_true", help="查看历史 run_id")
     parser.add_argument("--login", action="store_true", help="打开浏览器手动登录，保存登录态后退出")
     parser.add_argument("--discover", action="store_true", help="仅发现并打印类目树（不采集）")
+    parser.add_argument("--setup-smartsheet", action="store_true", help="一键创建企微智能表格并回写 .env")
     return parser.parse_args()
 
 
@@ -631,6 +651,15 @@ def main() -> None:
 
     if args.discover:
         asyncio.run(do_discover())
+        return
+
+    if args.setup_smartsheet:
+        from notify.wecom_smartsheet import setup_smartsheet
+        ok = setup_smartsheet()
+        if ok:
+            logger.info("智能表格创建成功！后续采集将自动同步到智能表格。")
+        else:
+            logger.error("智能表格创建失败，请检查 corpid / corpsecret 配置。")
         return
 
     if args.multi:

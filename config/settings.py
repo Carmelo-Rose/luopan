@@ -87,6 +87,17 @@ LARK_BASE_APP_TOKEN: str = os.getenv("LARK_BASE_APP_TOKEN", "")
 LARK_TABLE_ID: str = os.getenv("LARK_TABLE_ID", "")
 LARK_AS: str = os.getenv("LARK_AS", "user")  # user | bot
 
+# ── 企微智能表格同步（独立于 Webhook 通知）─────────────────────────────
+# 需要企业自建应用凭证（非群机器人 Webhook），配齐 4 项即自动启用。
+# corpid 在企业微信管理后台「我的企业 → 企业信息」底部获取（ww 开头）。
+# corpsecret 在「应用管理 → 自建应用 → 查看 Secret」获取。
+# docid / sheet_id 从智能表格 URL 或「文档 → 更多 → 权限」中获取。
+WECOM_CORPID: str = os.getenv("WECOM_CORPID", "")
+WECOM_CORPSECRET: str = os.getenv("WECOM_CORPSECRET", "")
+WECOM_SMARTSHEET_DOCID: str = os.getenv("WECOM_SMARTSHEET_DOCID", "")
+WECOM_SMARTSHEET_SHEET_ID: str = os.getenv("WECOM_SMARTSHEET_SHEET_ID", "")
+WECOM_SMARTSHEET_URL: str = os.getenv("WECOM_SMARTSHEET_URL", "")
+
 # 注：差分阈值的唯一真相源在 monitor/diff.py:_classify_rank_delta，
 # 不在此处配置（曾有一份从未被引用且与硬编码不一致的死配置，已移除）。
 

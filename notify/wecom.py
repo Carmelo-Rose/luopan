@@ -5,8 +5,6 @@
 消息按 notify/templates.py 的"推送规则"分组展示（新进 / 上升 10-30 / 30-50 / 50+）。
 """
 import logging
-import os
-import re
 import requests
 
 from notify.templates import group_events, format_line, build_header
@@ -125,71 +123,18 @@ def _chunk_grouped(
 
 # ── 多类目摘要推送 ────────────────────────────────────────────────────
 
-def _upload_file(webhook_url: str, file_path: str) -> str:
-    """
-    上传文件到企微 Webhook，返回 media_id。
-    使用 /cgi-bin/webhook/upload_media?key=<key>&type=file 接口。
-    """
-    if not webhook_url or not file_path:
-        return ""
-    # 从 webhook URL 提取 key
-    import re
-    m = re.search(r"key=([a-zA-Z0-9\-]+)", webhook_url)
-    if not m:
-        logger.error("无法从 webhook URL 提取 key")
-        return ""
-    key = m.group(1)
-    upload_url = f"https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media?key={key}&type=file"
-    try:
-        with open(file_path, "rb") as f:
-            filename = os.path.basename(file_path)
-            resp = requests.post(upload_url, files={"file": (filename, f)}, timeout=30)
-        if resp.status_code != 200:
-            logger.error("上传文件 HTTP %d: %s", resp.status_code, resp.text[:200])
-            return ""
-        data = resp.json()
-        if data.get("errcode", 0) != 0:
-            logger.error("上传文件返回错误: %s", data)
-            return ""
-        media_id = data.get("media_id", "")
-        logger.info("文件已上传: %s -> %s", filename, media_id[:30])
-        return media_id
-    except Exception as exc:
-        logger.error("上传文件异常: %s", exc)
-        return ""
-
-
-def _send_file(webhook_url: str, media_id: str) -> bool:
-    """通过企微 Webhook 发送文件消息。"""
-    if not media_id:
-        return False
-    payload = {"msgtype": "file", "file": {"media_id": media_id}}
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=10)
-        if resp.status_code != 200:
-            logger.error("发送文件 HTTP %d: %s", resp.status_code, resp.text[:200])
-            return False
-        data = resp.json()
-        if data.get("errcode", 0) != 0:
-            logger.error("发送文件返回错误: %s", data)
-            return False
-        logger.info("文件消息已推送")
-        return True
-    except Exception as exc:
-        logger.error("发送文件异常: %s", exc)
-        return False
-
 
 def send_summary(
     webhook_url: str,
     events: list[dict],
     categories_count: int,
-    excel_path: str,
     timestamp,
     category_results: list[dict] | None = None,
+    lark_url: str = "",
+    wecom_sheet_url: str = "",
 ) -> bool:
     """
-    多类目模式：发送简短摘要到企微，附带 Excel 文件（不推全量事件）。
+    多类目模式：发送简短摘要到企微，附带在线表格链接（不推全量事件）。
 
     格式：
         📊 罗盘榜单异动  2026-06-11 14:00
@@ -198,7 +143,8 @@ def send_summary(
         智能家居: 23 条 | 电子/电工: 45 条 | 家具: 12 条
         玩具乐器: 18 条 | 钟表配饰: 8 条
 
-        + Excel 文件附件
+        📊 飞书多维表格：[点击查看](链接)
+        📊 企微智能表格：[点击查看](链接)
     """
     # 确保时间为北京时间
     from datetime import timezone as _tz, timedelta
@@ -218,6 +164,14 @@ def send_summary(
         if category_results else ""
     )
 
+    # 构建链接文本（在 if not events 之前定义，以便两个分支都能使用）
+    link_lines = []
+    if lark_url:
+        link_lines.append(f"📊 飞书多维表格：[点击查看]({lark_url})")
+    if wecom_sheet_url:
+        link_lines.append(f"📊 企微智能表格：[点击查看]({wecom_sheet_url})")
+    link_hint = "\n".join(link_lines)
+
     if not events:
         # 无异动也发一条
         content = (
@@ -226,6 +180,8 @@ def send_summary(
             f"共采集 {categories_count} 个二级类目，**0 条异动**"
             f"{coverage_line}"
         )
+        if link_hint:
+            content += f"\n\n{link_hint}"
         messages = [content]
     else:
         # 按一级类目统计
@@ -246,15 +202,15 @@ def send_summary(
             f"{coverage_line.lstrip()}\n\n"
         )
         header_len = _blen(header)
-        excel_hint = ""
-        excel_hint_len = 0
+
+        link_hint_len = _blen(link_hint) if link_hint else 0
 
         chunks = []
         current_chunk_lines = []
         current_chunk_len = header_len
 
-        # 单行预算：header + excel_hint 之外可容纳的最大字节数
-        line_budget = _MAX_LEN - header_len - excel_hint_len
+        # 单行预算：header + link_hint 之外可容纳的最大字节数
+        line_budget = _MAX_LEN - header_len - link_hint_len
         for idx, line in enumerate(l1_lines):
             line_with_sep = f"{line} | " if idx < len(l1_lines) - 1 else line
             # 单行本身超预算时按字节截断，避免最终 chunk 突破企微上限
@@ -263,7 +219,7 @@ def send_summary(
             line_len = _blen(line_with_sep)
 
             # 如果加上这一行会超长，先保存当前块，开新块
-            if current_chunk_len + line_len + excel_hint_len > _MAX_LEN and current_chunk_lines:
+            if current_chunk_len + line_len + link_hint_len > _MAX_LEN and current_chunk_lines:
                 chunks.append("".join(current_chunk_lines).rstrip(" |"))
                 current_chunk_lines = []
                 current_chunk_len = header_len
@@ -274,15 +230,15 @@ def send_summary(
         if current_chunk_lines:
             chunks.append("".join(current_chunk_lines).rstrip(" |"))
 
-        # 第一块加 header，最后一块加 excel_hint
+        # 第一块加 header，最后一块加 link_hint
         messages = []
         if not chunks:
-            messages.append(header + excel_hint)
+            messages.append(header + link_hint)
         else:
             for i, chunk in enumerate(chunks):
                 msg = header + chunk
                 if i == len(chunks) - 1:
-                    msg += excel_hint
+                    msg += link_hint
                 messages.append(msg)
 
     if not webhook_url:
@@ -303,15 +259,6 @@ def send_summary(
                 return False
             success = True
         logger.info("企微摘要已推送 (%d 条消息)", len(messages))
-
-        # 上传并发送 Excel 文件
-        if excel_path and os.path.isfile(excel_path):
-            media_id = _upload_file(webhook_url, excel_path)
-            if not media_id:
-                logger.warning("Excel 文件上传失败，仅发送摘要文本")
-                return False
-            if not _send_file(webhook_url, media_id):
-                return False
 
         return success
     except Exception as exc:

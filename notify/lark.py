@@ -258,7 +258,7 @@ def sync_events_to_base(events: list[dict], run_id: str) -> int:
         written += len(batch)
         logger.info("飞书 Base 同步进度: %d/%d 条", written, len(rows))
 
-    logger.info("飞书 Base 同步完成: 写入 %d/%d 条（轮次 %s）", written, len(rows), round_label)
+    logger.info("飞书 Base 同步完成: 写入 %d/%d 条（轮次 %s）", written, len(rows), _round_label(run_id))
     return written
 
 
