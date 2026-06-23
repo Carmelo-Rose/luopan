@@ -6,6 +6,9 @@ import os
 from datetime import datetime
 from typing import Optional
 
+from monitor.diff import RANK_UP_100, RANK_UP_150
+from notify.templates import EVENT_LABELS
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -17,16 +20,8 @@ except ImportError:
     logger.warning("openpyxl 未安装，Excel 报告功能不可用")
 
 
-# 事件类型中文映射
-_EVENT_LABELS = {
-    "NEW_ENTRY": "新进榜",
-    "ENTER_TOP10": "冲进TOP10",
-    "RANK_UP_50_PLUS_WARNING": "暴升50+",
-    "RANK_UP_30_50_WARNING": "急升30-50",
-    "RANK_UP_20": "上升20-29",
-    "RANK_UP_10": "上升10-19",
-    "RANK_UP_5": "上升5-9",
-}
+# 事件类型中文映射（引用 templates.EVENT_LABELS，不重复定义）
+_EVENT_LABELS = EVENT_LABELS
 
 _HEADER_FILL = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid") if HAS_OPENPYXL else None
 _HEADER_FONT = Font(color="FFFFFF", bold=True, size=11) if HAS_OPENPYXL else None
@@ -48,6 +43,9 @@ _COLUMNS = [
     ("上轮排名", 10),
     ("事件类型", 14),
     ("商品标题", 50),
+    ("支付金额", 16),
+    ("价格", 12),
+    ("商品图", 50),
 ]
 
 _COVERAGE_COLUMNS = [
@@ -173,11 +171,12 @@ def _write_events(ws, events: list[dict]) -> None:
             rank_prev if rank_prev is not None else "-",
             _EVENT_LABELS.get(ev.get("event_type", ""), ev.get("event_type", "")),
             ev.get("product_title", ""),
+            ev.get("pay_amount", ""),
+            ev.get("price", ""),
+            ev.get("image", ""),
         ]
 
-        is_warning = ev.get("event_type") in (
-            "ENTER_TOP10", "RANK_UP_50_PLUS_WARNING", "RANK_UP_30_50_WARNING"
-        )
+        is_warning = ev.get("event_type") in (RANK_UP_100, RANK_UP_150)
 
         for col_idx, value in enumerate(values, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)

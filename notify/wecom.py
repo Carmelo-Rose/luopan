@@ -2,7 +2,7 @@
 企业微信群机器人 Webhook 推送。
 文档：https://developer.work.weixin.qq.com/document/path/91770
 
-消息按 notify/templates.py 的"推送规则"分组展示（新进 / 上升 10-30 / 30-50 / 50+）。
+消息按 notify/templates.py 的分组规则展示（升150+ / 升100+ / 升50+ / 新进榜）。
 """
 import logging
 import requests

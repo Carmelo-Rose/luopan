@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS products_snapshot (
     product_id       TEXT    NOT NULL,
     product_title    TEXT,
     product_url      TEXT,
+    image            TEXT    DEFAULT '',         -- 商品主图 URL（接口 product_info.image_url）
     price_range      TEXT,
     pay_amount       TEXT,
     clicks           TEXT,
@@ -29,13 +30,16 @@ CREATE TABLE IF NOT EXISTS ranking_event (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id         TEXT    NOT NULL,            -- 本轮 run_id
     scope_key      TEXT    NOT NULL,
-    event_type     TEXT    NOT NULL,            -- NEW_ENTRY / RANK_UP_10 / ...
+    event_type     TEXT    NOT NULL,            -- NEW_ENTRY / RANK_UP_50 / RANK_UP_100 / RANK_UP_150
     product_id     TEXT    NOT NULL,
     product_title  TEXT,
     product_url    TEXT,
     rank_current   INTEGER,
     rank_previous  INTEGER,
     rank_delta     INTEGER,                     -- 正数 = 上升
+    image          TEXT    DEFAULT '',          -- 商品主图 URL
+    pay_amount     TEXT    DEFAULT '',          -- 支付金额（脱敏区间，来自快照）
+    price          TEXT    DEFAULT '',          -- 实际价格（异动商品详情页拓价，回退价格带）
     created_at     TEXT    NOT NULL,
     notified       INTEGER NOT NULL DEFAULT 0,  -- 0=待推送 1=已推送
     industry_name  TEXT    DEFAULT '',          -- 一级类目名

@@ -409,3 +409,97 @@ def save_category_tree(cache_path: str, tree: dict) -> None:
         logger.info("类目树已缓存到: %s", cache_path)
     except Exception as e:
         logger.warning("保存类目树缓存失败: %s", e)
+
+
+def resolve_leaf_targets(
+    raw_options: list,
+    path: list[str],
+    leaf_names: list[str],
+) -> list[dict]:
+    """
+    从原始类目树中解析叶子类目目标（服配支线用）。
+
+    Parameters
+    ----------
+    raw_options : list
+        完整原始类目树（category_raw_dump.json 的内容）。
+    path : list[str]
+        从 L1 到目标父节点的名称路径，如 ["服饰内衣", "服装", "服装配饰"]。
+    leaf_names : list[str]
+        要匹配的叶子类目名称列表，如 ["帽子", "丝巾/披肩/头巾", ...]。
+
+    Returns
+    -------
+    list[dict]
+        [{"industry_name", "category_name", "leaf_name", "industry_id",
+          "category_id", "leaf_category_id", "rank_category_id"}, ...]
+        industry_id = L1 的 id，category_id = L2 的 id（写快照 category_name 用），
+        leaf_category_id = 叶子自身 id，
+        rank_category_id = 榜单 API 用的完整类目路径「L2,L3,...,叶子」逗号拼接，
+            直接传给短视频榜接口即可拉到该叶子专属 TOP200。
+        category_name = path[1]（真实二级类目，对齐飞书「二级类目」列语义），
+        leaf_name = 叶子自身名（用于 scope_key 区分各叶子）。
+    """
+    if not path or not leaf_names:
+        return []
+
+    # 逐层按名匹配，定位到目标父节点，并沿途收集各层 id。
+    # cat_path_ids = path[1:] 各层 id（L2..父节点），短视频榜 API 的 category_id
+    # 需要「L2,L3,...,叶子」整条路径逗号拼接（实测：只传叶子 id 返回空，传完整路径
+    # 即可直接出该叶子的 TOP200）。
+    current_level = raw_options
+    parent_node = None
+    l1_id = ""
+    cat_path_ids: list[str] = []
+    for depth, name in enumerate(path):
+        found = None
+        for node in current_level:
+            if _clean_label(node) == name:
+                found = node
+                break
+        if not found:
+            logger.warning("resolve_leaf_targets: 第 %d 层未找到 %r，已遍历: %s",
+                           depth + 1, name, [_clean_label(n) for n in current_level[:10]])
+            return []
+        if depth == 0:
+            l1_id = _node_id(found)            # path[0] = L1 → industry_id
+        else:
+            cat_path_ids.append(_node_id(found))  # path[1:] = L2..父节点
+        parent_node = found
+        current_level = found.get("children") or []
+
+    if not parent_node:
+        return []
+
+    cat_path = ",".join(cat_path_ids)          # 如 "1000003282,1000003289"（服装,服装配饰）
+    l2_id = cat_path_ids[0] if cat_path_ids else ""
+    # 真实二级类目名（path[1]），写入快照的 category_name 列，与大盘语义一致。
+    l2_name = path[1] if len(path) >= 2 else path[0]
+
+    # 匹配叶子
+    leaf_set = set(leaf_names)
+    results: list[dict] = []
+    for child in (parent_node.get("children") or []):
+        child_name = _clean_label(child)
+        if child_name in leaf_set:
+            leaf_id = _node_id(child)
+            results.append({
+                "industry_name": path[0],
+                "category_name": l2_name,
+                "leaf_name": child_name,
+                "industry_id": l1_id,
+                "category_id": l2_id,
+                "leaf_category_id": leaf_id,
+                # 榜单 API 用的完整类目路径 L2,L3,...,叶子（直采该叶子 TOP200）
+                "rank_category_id": f"{cat_path},{leaf_id}" if cat_path else leaf_id,
+            })
+            leaf_set.discard(child_name)
+
+    if leaf_set:
+        logger.warning("resolve_leaf_targets: 未匹配到的叶子: %s（可能已更名或无权限）",
+                       sorted(leaf_set))
+
+    logger.info("resolve_leaf_targets: 路径 %s → 匹配 %d/%d 个叶子: %s",
+                " > ".join(path), len(results), len(leaf_names),
+                [r["leaf_name"] for r in results])
+    return results

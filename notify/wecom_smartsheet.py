@@ -25,6 +25,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from config import settings
+from notify.templates import EVENT_LABELS
 
 logger = logging.getLogger(__name__)
 
@@ -49,25 +50,14 @@ def _write_env(key: str, value: str) -> None:
 
 # ── 事件类型 → 中文标签 + 优先级（用于排序） ──────────────────────────
 
-_EVENT_LABELS = {
-    "NEW_ENTRY": "新进榜",
-    "ENTER_TOP10": "冲进TOP10",
-    "RANK_UP_50_PLUS_WARNING": "暴升50+",
-    "RANK_UP_30_50_WARNING": "急升30-50",
-    "RANK_UP_20": "上升20-29",
-    "RANK_UP_10": "上升10-19",
-    "RANK_UP_5": "上升5-9",
-}
+_EVENT_LABELS = EVENT_LABELS
 
 # 排序优先级：数值越小越靠前
 _EVENT_PRIORITY = {
-    "ENTER_TOP10": 0,
-    "RANK_UP_50_PLUS_WARNING": 1,
-    "RANK_UP_30_50_WARNING": 2,
-    "RANK_UP_20": 3,
-    "RANK_UP_10": 4,
-    "RANK_UP_5": 5,
-    "NEW_ENTRY": 6,
+    "RANK_UP_150": 0,
+    "RANK_UP_100": 1,
+    "RANK_UP_50": 2,
+    "NEW_ENTRY": 3,
 }
 
 _CST = timezone(timedelta(hours=8))
@@ -214,6 +204,9 @@ def _event_to_values(ev: dict, round_label: str) -> dict:
             "text": _EVENT_LABELS.get(ev.get("event_type", ""), ev.get("event_type", "")),
             "style": _EVENT_STYLE.get(ev.get("event_type", ""), 7),
         }],
+        "支付金额": _txt(ev.get("pay_amount", "") or ""),
+        "价格": _txt(ev.get("price", "") or ""),
+        "商品图": _txt(ev.get("image", "") or ""),
         "采集轮次": _txt(round_label),
     }
 
@@ -221,7 +214,7 @@ def _event_to_values(ev: dict, round_label: str) -> dict:
 def _event_sort_key(ev: dict) -> tuple:
     """排序键：(事件优先级, 当前排名, 商品标题)。
 
-    冲进TOP10 排最前，然后按升幅大小递减，最后按排名。
+    升150+ 排最前，然后按升幅档位递减，最后按排名。
     """
     etype = ev.get("event_type", "NEW_ENTRY")
     prio = _EVENT_PRIORITY.get(etype, 99)
@@ -242,19 +235,19 @@ _SHEET_FIELD_DEFS = [
     {"field_title": "上轮排名",  "field_type": "FIELD_TYPE_NUMBER"},
     {"field_title": "升幅",       "field_type": "FIELD_TYPE_SINGLE_SELECT"},
     {"field_title": "事件类型",  "field_type": "FIELD_TYPE_SINGLE_SELECT"},
+    {"field_title": "支付金额",  "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "价格",       "field_type": "FIELD_TYPE_TEXT"},
+    {"field_title": "商品图",    "field_type": "FIELD_TYPE_TEXT"},
     {"field_title": "采集轮次",  "field_type": "FIELD_TYPE_TEXT"},
 ]
 
 # 事件类型 → 单选标签颜色 style（企微智能表格 style 1-27）
 # 颜色越深 = 优先级越高，红>橙>黄>蓝>绿>灰>紫
 _EVENT_STYLE = {
-    "ENTER_TOP10":                18,  # 红 — 冲进TOP10
-    "RANK_UP_50_PLUS_WARNING":    20,  # 橙 — 暴升50+
-    "RANK_UP_30_50_WARNING":      23,  # 黄 — 急升30-50
-    "RANK_UP_20":                 10,  # 浅蓝 — 上升20-29
-    "RANK_UP_10":                 15,  # 浅绿 — 上升10-19
-    "RANK_UP_5":                  7,   # 浅灰 — 上升5-9
-    "NEW_ENTRY":                  5,   # 浅紫 — 新进榜
+    "RANK_UP_150":    18,  # 红 — 升150+
+    "RANK_UP_100":    20,  # 橙 — 升100+
+    "RANK_UP_50":     23,  # 黄 — 升50+
+    "NEW_ENTRY":       5,  # 浅紫 — 新进榜
 }
 
 # 一级类目 → 单选标签颜色（对标飞书配色）
@@ -492,7 +485,7 @@ def sync_to_smartsheet(events: list[dict], run_id: str) -> int:
         logger.info("未配置企微智能表格 docid/sheet_id，跳过同步")
         return 0
 
-    # 按事件重要性排序：冲进TOP10 > 暴升50+ > ... > 新进榜
+    # 按事件重要性排序：升150+ > 升100+ > 升50+ > 新进榜
     sorted_events = sorted(events, key=_event_sort_key)
 
     rows = [
@@ -525,162 +518,5 @@ def sync_to_smartsheet(events: list[dict], run_id: str) -> int:
     return written
 
 
-# ── 高强度事件子表 ───────────────────────────────────────────────────
-
-# 高强度事件类型列表
-_HIGH_EVENT_TYPES = ["ENTER_TOP10", "RANK_UP_50_PLUS_WARNING", "RANK_UP_30_50_WARNING"]
-
-# 高强度子表的 sheet_id 环境变量名
-_HIGH_SHEET_ID_KEY = "WECOM_SMARTSHEET_HIGH_SHEET_ID"
-
-
-def _get_high_sheet_id() -> str:
-    """获取高强度子表的 sheet_id。"""
-    return os.environ.get(_HIGH_SHEET_ID_KEY, "") or getattr(settings, _HIGH_SHEET_ID_KEY, "")
-
-
-def _write_high_sheet_id(sheet_id: str) -> None:
-    """回写高强度子表的 sheet_id 到 .env 和 settings。"""
-    _write_env(_HIGH_SHEET_ID_KEY, sheet_id)
-    os.environ[_HIGH_SHEET_ID_KEY] = sheet_id
-    setattr(settings, _HIGH_SHEET_ID_KEY, sheet_id)
-
-
-def _create_high_sheet(docid: str) -> str:
-    """创建高强度异动子表，返回新 sheet_id。"""
-    # 1. 创建子表
-    data = _wecom_cli(["doc", "smartsheet_add_sheet", json.dumps({
-        "docid": docid, "properties": {"title": "高强度异动", "index": 0}
-    })])
-    new_sheet_id = data.get("properties", {}).get("sheet_id", "")
-    if not new_sheet_id:
-        raise RuntimeError(f"add_sheet 未返回 sheet_id: {data}")
-    logger.info("高强度子表已创建: %s", new_sheet_id)
-
-    # 2. 获取默认字段并重命名
-    data = _wecom_cli(["doc", "smartsheet_get_fields", json.dumps({"docid": docid, "sheet_id": new_sheet_id})])
-    default_fields = data.get("fields", [])
-    if default_fields:
-        fid = default_fields[0]["field_id"]
-        ftype = default_fields[0]["field_type"]
-        _wecom_cli(["doc", "smartsheet_update_fields", json.dumps({
-            "docid": docid, "sheet_id": new_sheet_id,
-            "fields": [{"field_id": fid, "field_title": _SHEET_FIELD_DEFS[0]["field_title"], "field_type": ftype}],
-        })])
-        logger.info("默认字段已重命名为: %s", _SHEET_FIELD_DEFS[0]["field_title"])
-
-    # 3. 添加剩余字段
-    remaining = _SHEET_FIELD_DEFS[1:]
-    if remaining:
-        _wecom_cli(["doc", "smartsheet_add_fields", json.dumps({
-            "docid": docid, "sheet_id": new_sheet_id, "fields": remaining
-        })])
-        logger.info("已添加 %d 个额外字段", len(remaining))
-
-    # 4. 回写 sheet_id
-    _write_high_sheet_id(new_sheet_id)
-
-    return new_sheet_id
-
-
-def sync_to_smartsheet_with_high(events: list[dict], run_id: str) -> tuple[int, int]:
-    """
-    写入两个子表：
-    1. 全部异动（现有逻辑）
-    2. 高强度异动（只包含冲进TOP10、暴升50+、急升30-50）
-
-    返回 (全部写入数, 高强度写入数)。
-    """
-    if not events:
-        return 0, 0
-
-    if not (settings.WECOM_SMARTSHEET_DOCID and settings.WECOM_SMARTSHEET_SHEET_ID):
-        logger.info("未配置企微智能表格 docid/sheet_id，跳过同步")
-        return 0, 0
-
-    docid = settings.WECOM_SMARTSHEET_DOCID
-
-    # 按事件重要性排序
-    sorted_events = sorted(events, key=_event_sort_key)
-
-    # ── 写入全部异动子表 ────────────────────────────────────────────
-    rows_all = [
-        _event_to_values(e, _round_label(e.get("run_id") or run_id))
-        for e in sorted_events
-    ]
-
-    if _WRITE_MODE == "overwrite":
-        try:
-            sheet_id = _recreate_sheet()
-        except RuntimeError as e:
-            logger.error("重建全部异动子表失败: %s", e)
-            return 0, 0
-    else:
-        sheet_id = settings.WECOM_SMARTSHEET_SHEET_ID
-
-    written_all = 0
-    for i in range(0, len(rows_all), _BATCH_SIZE):
-        batch = rows_all[i:i + _BATCH_SIZE]
-        if not _batch_create(batch, docid, sheet_id):
-            logger.warning("全部异动第 %d 批写入失败", i // _BATCH_SIZE + 1)
-            break
-        written_all += len(batch)
-        logger.info("全部异动进度: %d/%d", written_all, len(rows_all))
-
-    logger.info("全部异动子表完成: %d/%d", written_all, len(rows_all))
-
-    # ── 写入高强度异动子表 ────────────────────────────────────────────
-    high_events = [e for e in sorted_events if e.get("event_type") in _HIGH_EVENT_TYPES]
-
-    if not high_events:
-        logger.info("无高强度事件，跳过高强度子表")
-        return written_all, 0
-
-    rows_high = [
-        _event_to_values(e, _round_label(e.get("run_id") or run_id))
-        for e in high_events
-    ]
-
-    # 创建或重建高强度子表
-    high_sheet_id = _get_high_sheet_id()
-    if _WRITE_MODE == "overwrite" or not high_sheet_id:
-        # overwrite 模式下先删除所有名为"高强度异动"的旧子表（含残留）
-        if _WRITE_MODE == "overwrite":
-            try:
-                all_sheets_data = _wecom_cli([
-                    "doc", "smartsheet_get_sheet",
-                    json.dumps({"docid": docid}),
-                ])
-                for s in all_sheets_data.get("sheet_list", []):
-                    if s.get("title") == "高强度异动":
-                        sid = s.get("sheet_id", "")
-                        try:
-                            _wecom_cli([
-                                "doc", "smartsheet_delete_sheet",
-                                json.dumps({"docid": docid, "sheet_id": sid}),
-                            ])
-                            logger.info("旧高强度子表已删除: %s", sid)
-                        except RuntimeError as e:
-                            logger.warning("删除旧高强度子表 %s 失败: %s", sid, e)
-            except RuntimeError as e:
-                logger.warning("获取子表列表失败: %s", e)
-        try:
-            high_sheet_id = _create_high_sheet(docid)
-        except RuntimeError as e:
-            logger.error("创建高强度子表失败: %s", e)
-            return written_all, 0
-
-    written_high = 0
-    for i in range(0, len(rows_high), _BATCH_SIZE):
-        batch = rows_high[i:i + _BATCH_SIZE]
-        if not _batch_create(batch, docid, high_sheet_id):
-            logger.warning("高强度异动第 %d 批写入失败", i // _BATCH_SIZE + 1)
-            break
-        written_high += len(batch)
-        logger.info("高强度异动进度: %d/%d", written_high, len(rows_high))
-
-    logger.info("高强度异动子表完成: %d/%d", written_high, len(high_events))
-
-    return written_all, written_high
 
 

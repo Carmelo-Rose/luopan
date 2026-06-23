@@ -81,6 +81,24 @@ def _generate_mock_products(
     return products
 
 
+def _enrich_event_prices(events: list[dict]) -> None:
+    """对事件商品逐个打开详情页抓真实价格，就地回填到事件 dict 的 price 字段。
+
+    抓价独立开一个浏览器会话（在主采集会话关闭后调用，避免 profile 冲突）；整体失败
+    不抛出，事件保留 compute_diff 写入的 price_bin 回退值。
+    """
+    try:
+        from collector.product_price import fetch_event_prices_sync
+        price_map = fetch_event_prices_sync(events)
+    except Exception as exc:
+        logger.warning("详情页拓价整体失败，保留价格带回退值: %s", exc)
+        return
+    for e in events:
+        p = price_map.get(e.get("product_id"))
+        if p:
+            e["price"] = p
+
+
 # ── 单类目流程（向后兼容）─────────────────────────────────────────────
 
 async def run_once(
@@ -145,6 +163,12 @@ async def run_once(
         events = compute_diff(run_id, scope_key, current_snapshot, previous_snapshot)
         logger.info("差分完成，发现 %d 条事件", len(events))
 
+        # 详情页拓价已停用（2026-06-23）：价格列用脱敏价格带（price_bin）。
+        # 风控+大量事件下逐条开详情页会空转数小时且拿不到价。如需恢复到手价（需先
+        # 解决详情页风控），取消下面两行注释即可（_enrich_event_prices/product_price.py 保留）。
+        # if events and not mock:
+        #     _enrich_event_prices(events)
+
         database.insert_events(conn, events)
 
         event_summary = {}
@@ -175,7 +199,7 @@ async def run_once(
 async def run_multi(
     dry_run: bool = False,
     mock: bool = False,
-    scope_prefix: str = "card_order",
+    scope_prefix: str = "video_order",
 ) -> dict:
     """
     多类目模式：自动发现目标一级类目下所有二级类目，逐个采集并生成报告。
@@ -368,6 +392,21 @@ async def run_multi(
                     "products": cat_total, "events": len(events),
                 })
 
+        # ── 详情页拓价已停用（2026-06-23）──────────────────────────
+        # 价格列用脱敏价格带（price_bin，compute_diff 已回填）。原因：风控下逐条开详情页
+        # 对几百条异动会空转 ~90 分钟且拿不到到手价（今日两次实测），拖垮定时窗口。
+        # 如需恢复到手价（须先解决详情页风控），取消下面整段注释即可；_enrich_event_prices
+        # 与 collector/product_price.py 保留备用。
+        # if all_events and not mock:
+        #     _enrich_event_prices(all_events)
+        #     if not dry_run:
+        #         price_map = {
+        #             e["product_id"]: e.get("price", "")
+        #             for e in all_events if e.get("price")
+        #         }
+        #         updated = database.update_event_prices(conn, run_id, price_map)
+        #         logger.info("详情页价格回填 DB: %d 条", updated)
+
         # ── 推送 + 同步 ──────────────────────────────────────────
         # 关键：以「数据库里仍待送达的事件」为准，而非仅本进程内存中的 all_events。
         # 推送/同步排在整轮采集之后，若上一轮在中途被硬杀（没走到这一步），其已落库的
@@ -408,15 +447,17 @@ async def run_multi(
                 written = sync_events_to_base(to_send, run_id)
                 logger.info("飞书 Base 同步: 写入 %d / %d 条事件", written, len(to_send))
 
-            # ── 企微智能表格同步（通过 wecom-cli，配齐 docid+sheet_id 即启用）──
-            # 注意：不依赖 to_send，即使无新事件也同步最新数据到智能表格
-            if settings.WECOM_SMARTSHEET_DOCID and settings.WECOM_SMARTSHEET_SHEET_ID:
-                from notify.wecom_smartsheet import sync_to_smartsheet
-                # 使用 all_events（本轮采集的所有事件）而非 to_send（待推送事件）
-                sm_events = all_events if all_events else to_send
-                written_sm = sync_to_smartsheet(sm_events, run_id)
-                if written_sm:
-                    logger.info("企微智能表格同步: 写入 %d 条事件", written_sm)
+            # ── 企微智能表格同步（已停用，2026-06-23）─────────────────────
+            # 运营决定异动数据统一落飞书表（大盘表 + 服配表），企微侧只保留 Webhook 摘要
+            # 推送，不再写企微智能表格。下面同步逻辑暂注释保留，恢复时取消注释即可（同时需
+            # 在 .env 配齐 WECOM_SMARTSHEET_DOCID / WECOM_SMARTSHEET_SHEET_ID）。
+            # if settings.WECOM_SMARTSHEET_DOCID and settings.WECOM_SMARTSHEET_SHEET_ID:
+            #     from notify.wecom_smartsheet import sync_to_smartsheet
+            #     # 使用 all_events（本轮采集的所有事件）而非 to_send（待推送事件）
+            #     sm_events = all_events if all_events else to_send
+            #     written_sm = sync_to_smartsheet(sm_events, run_id)
+            #     if written_sm:
+            #         logger.info("企微智能表格同步: 写入 %d 条事件", written_sm)
 
         logger.info(
             "═══ 多类目采集完成 | %d 个类目 | %d 条商品 | %d 条事件 | baseline=%d ═══",
@@ -625,10 +666,261 @@ def list_runs(scope_key: str) -> None:
         print(f"  {r}")
 
 
+# ── 服配叶子类目支线 ─────────────────────────────────────────────────
+
+
+def _process_category(
+    conn, run_id: str, scope_key: str,
+    products: list[dict], dry_run: bool,
+    emit_initial_events: bool = False,
+) -> tuple[list[dict], int, str]:
+    """单类目「写快照 → 差分 → 写事件」管道。返回 (events, 商品数, status)。
+
+    status: "baseline" | "有异动" | "无异动"。dry_run 时不落库事件（遵守不写 notified 契约）。
+    emit_initial_events=True 时，首轮也按 NEW_ENTRY 写事件；仅用于服配支线补齐明细表。
+    """
+    cat_total = len(products)
+    database.insert_snapshot(conn, run_id, products)
+
+    latest_run, previous_run = database.get_latest_two_run_ids(conn, scope_key)
+    if previous_run is None:
+        if not emit_initial_events:
+            logger.info("[%s] 首次运行，仅 baseline", scope_key)
+            return [], cat_total, "baseline"
+        current_snap = database.get_snapshot(conn, latest_run, scope_key)
+        events = compute_diff(run_id, scope_key, current_snap, [])
+        logger.info("[%s] 首次运行，按 NEW_ENTRY 写入 %d 条事件", scope_key, len(events))
+        if events and not dry_run:
+            database.insert_events(conn, events)
+        return events, cat_total, "有异动" if events else "无异动"
+
+    current_snap = database.get_snapshot(conn, latest_run, scope_key)
+    previous_snap = database.get_snapshot(conn, previous_run, scope_key)
+    events = compute_diff(run_id, scope_key, current_snap, previous_snap)
+    logger.info("[%s] 差分: %d 条事件", scope_key, len(events))
+
+    if events and not dry_run:
+        database.insert_events(conn, events)
+
+    return events, cat_total, "有异动" if events else "无异动"
+
+
+async def run_acc(dry_run: bool = False, mock: bool = False) -> dict:
+    """
+    服配叶子类目支线：监控指定叶子类目的榜单异动，写入专属飞书表。
+
+    与大盘（run_multi）完全隔离：scope_key 前缀 video_acc，推送企微消息并写服配飞书表，
+    不写企微智能表格、不生成 Excel。采集源跟随全局配置（与大盘一致，当前为短视频榜）。
+
+    叶子直采：短视频榜 API 的 category_id 接受「L2,L3,...,叶子」完整路径，故每个叶子
+    用 resolve_leaf_targets 给出的 rank_category_id 直采该叶子专属 TOP200，不再采 L2
+    整榜后本地过滤（旧法 TOP200 内常 0 命中配饰叶子）。
+    """
+    run_id = datetime.now(timezone.utc).isoformat()
+    ts = datetime.now()
+    scope_prefix = "video_acc"
+    logger.info("═══ 服配支线 run_id: %s ═══", run_id)
+
+    # ── 解析叶子目标 ──────────────────────────────────────────────────
+    if mock:
+        l1 = settings.ACC_PATH[0] if settings.ACC_PATH else "服饰内衣"
+        l2 = settings.ACC_PATH[1] if len(settings.ACC_PATH) >= 2 else l1
+        targets = [
+            {
+                "industry_name": l1, "category_name": l2, "leaf_name": name,
+                "industry_id": "4", "category_id": "mock_acc_l2",
+                "leaf_category_id": f"mock_acc_leaf_{i}",
+            }
+            for i, name in enumerate(settings.ACC_LEAF_NAMES)
+        ]
+    else:
+        dump_path = os.path.join(settings.BASE_DIR, "data", "category_raw_dump.json")
+        if not os.path.exists(dump_path):
+            logger.error("类目原始树 dump 不存在: %s，请先运行 --discover 或 --multi 建立缓存", dump_path)
+            return {"run_id": run_id, "categories_collected": 0, "total_products": 0, "all_events": []}
+        with open(dump_path, "r", encoding="utf-8") as f:
+            raw_options = json.load(f)
+
+        from collector.category_discovery import resolve_leaf_targets
+        targets = resolve_leaf_targets(raw_options, settings.ACC_PATH, settings.ACC_LEAF_NAMES)
+        if not targets:
+            logger.error("未匹配到任何叶子类目目标，终止")
+            return {"run_id": run_id, "categories_collected": 0, "total_products": 0, "all_events": []}
+
+    logger.info("服配支线目标: %s", [t["leaf_name"] for t in targets])
+
+    db_path = settings.DB_PATH
+    database.init_db(db_path)
+    conn = database.get_connection(db_path)
+
+    all_events: list[dict] = []
+    total_products = 0
+    categories_collected = 0
+
+    try:
+        if mock:
+            for cat in targets:
+                scope_key = f"{scope_prefix}_{cat['leaf_name']}"
+                existing = database.get_all_run_ids(conn, scope_key)
+                shift = len(existing) * 30
+                products = _generate_mock_products(
+                    scope_key, seed_shift=shift,
+                    industry_name=cat["industry_name"],
+                    category_name=cat["category_name"],
+                )
+                events, cat_total, _ = _process_category(conn, run_id, scope_key, products, dry_run)
+                categories_collected += 1
+                total_products += cat_total
+                all_events.extend(events)
+        else:
+            from collector.douyin_compass import DouyinCompassCollector
+            async with DouyinCompassCollector() as collector:
+                # 预热：先做一次冷导航建立 base API URL + 选中「短视频榜」tab。
+                # 实测首个叶子若走冷启动（_reuse_page=False）拿不到数据，故先预热再
+                # 逐叶子以 _reuse_page=True 直采，让 SPA 按完整类目路径原生加载叶子榜。
+                #
+                # 关键坑（2026-06-23 排查）：预热必须用「父级路径」(L2,L3 去掉叶子)，
+                # 不能用 targets[0] 的完整叶子路径。否则预热已把第一个叶子(targets[0])的
+                # 路径加载好，循环首轮再对同一路径 _reuse_page=True 不会触发新的 XHR，
+                # 该叶子拿 0 条被跳过（曾误判为「面罩无短视频榜」——其实 UI 确认面罩有榜，
+                # 只是它恰好是 targets[0]）。用父级路径预热，循环里每个叶子都是全新路径→新 XHR。
+                warm = targets[0]
+                warm_path = ",".join(warm["rank_category_id"].split(",")[:-1]) or warm["rank_category_id"]
+                try:
+                    await collector.collect(
+                        scope_key=f"{scope_prefix}__warmup",
+                        industry_id=warm["industry_id"],
+                        category_id=warm_path,
+                        industry_name=warm["industry_name"],
+                        category_name=warm["category_name"],
+                        _reuse_page=False,
+                    )
+                except Exception as e:
+                    logger.warning("服配预热导航失败（继续逐叶采集）: %s", e)
+
+                total = len(targets)
+                for idx, target in enumerate(targets, 1):
+                    scope_key = f"{scope_prefix}_{target['leaf_name']}"
+                    logger.info(
+                        "═══ [%d/%d] 服配叶子直采 %s（path=%s）═══",
+                        idx, total, target["leaf_name"], target["rank_category_id"],
+                    )
+                    try:
+                        # 关键：category_id 传完整路径 L2,L3,叶子 → 直接拉该叶子专属 TOP200
+                        products = await collector.collect(
+                            scope_key=scope_key,
+                            industry_id=target["industry_id"],
+                            category_id=target["rank_category_id"],
+                            industry_name=target["industry_name"],
+                            category_name=target["category_name"],
+                            _reuse_page=True,
+                        )
+                    except Exception as e:
+                        logger.error("[%s] 采集异常: %s", scope_key, e)
+                        continue
+
+                    if not products:
+                        logger.warning("[%s] 该叶子短视频榜返回 0 条，跳过", scope_key)
+                        continue
+
+                    # 直采结果已是该叶子专属榜；强制回填叶子名（避免 lookup 索引缺失时为空）
+                    for p in products:
+                        p["leaf_category_name"] = target["leaf_name"]
+
+                    logger.info("[%s] 采到 %d 条", scope_key, len(products))
+                    events, cat_total, _ = _process_category(
+                        conn, run_id, scope_key, products, dry_run,
+                        emit_initial_events=True,
+                    )
+                    categories_collected += 1
+                    total_products += cat_total
+                    all_events.extend(events)
+
+                    if idx < total:
+                        await asyncio.sleep(3)
+
+        # ── 服配不做详情页拓价（运营决定，2026-06-23）──────────────────
+        # 叶子直采后首轮即 5×TOP200≈千条 NEW_ENTRY，逐条开详情页拓价会撞风控空转数小时；
+        # 配饰监控用脱敏价格带（price_bin，如 ¥59.9-¥89.9）已够用。价格列即 compute_diff
+        # 写入的 price_range 回退值，无需回填。支付金额/商品图不受影响，照常落表。
+
+        # ── 推送：服配企微消息 + 服配飞书表；不写企微智能表格，不生成 Excel ──
+        if dry_run:
+            logger.info("[DRY-RUN] 跳过企微推送与飞书写入，共 %d 条事件", len(all_events))
+            for e in all_events[:10]:
+                logger.info("  [%s] %s rank=%s %s",
+                            e["event_type"], e.get("leaf_category_name", "") or e.get("category_name", ""),
+                            e["rank_current"], e["product_title"][:30])
+        else:
+            # 补发窗口按 video_acc 前缀隔离，避免被大盘轮次挤出窗口（见 database 注释）
+            recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
+            to_send = [
+                e for e in database.get_pending_events(conn)
+                if e.get("run_id") in recent_runs
+                and (e.get("scope_key") or "").startswith(scope_prefix)
+            ]
+            backlog = len(to_send) - len(all_events)
+            if backlog > 0:
+                logger.info("检测到上一轮未送达事件 %d 条，本轮一并补发", backlog)
+
+            lark_ok = False
+            if to_send and settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
+                from notify.lark import sync_events_to_base
+                written = sync_events_to_base(
+                    to_send, run_id, table_id=settings.LARK_ACC_TABLE_ID, include_leaf=True,
+                )
+                logger.info("服配飞书 Base 同步: 写入 %d / %d 条事件", written, len(to_send))
+                lark_ok = written == len(to_send)
+            elif to_send and not settings.LARK_ACC_TABLE_ID:
+                logger.warning("未配置 LARK_ACC_TABLE_ID，跳过服配飞书同步（事件保留待下轮补发）")
+
+            wecom_ok = False
+            if to_send:
+                from notify.wecom import send_summary
+                lark_url = ""
+                if settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
+                    lark_url = (
+                        f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}"
+                        f"?table={settings.LARK_ACC_TABLE_ID}"
+                    )
+                wecom_ok = send_summary(
+                    settings.WECOM_WEBHOOK_URL,
+                    events=to_send,
+                    categories_count=categories_collected,
+                    timestamp=ts,
+                    category_results=[],
+                    lark_url=lark_url,
+                    wecom_sheet_url="",
+                )
+                logger.info("服配企微摘要推送: %s（%d 条事件）", "成功" if wecom_ok else "失败", len(to_send))
+
+            # 企微 + 飞书都成功才标记，任一失败都保留待下轮补发。
+            if to_send and lark_ok and wecom_ok:
+                ids = [e["id"] for e in to_send if e.get("id") is not None]
+                if ids:
+                    database.mark_events_notified(conn, ids)
+                    logger.info("服配支线: 标记 %d 条事件为已通知", len(ids))
+
+        logger.info(
+            "═══ 服配支线完成 | %d 个叶子 | %d 条商品 | %d 条事件 ═══",
+            categories_collected, total_products, len(all_events),
+        )
+        return {
+            "run_id": run_id,
+            "categories_collected": categories_collected,
+            "total_products": total_products,
+            "all_events": all_events,
+        }
+
+    finally:
+        conn.close()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="抖音罗盘商品榜 TOP200 监控系统")
-    parser.add_argument("--scope", default="card_order", help="榜单维度 scope_key（默认 card_order）")
+    parser.add_argument("--scope", default="video_order", help="榜单维度 scope_key（默认 video_order=短视频榜；旧商品卡榜为 card_order）")
     parser.add_argument("--multi", action="store_true", help="多类目模式：自动发现并遍历所有目标类目")
+    parser.add_argument("--acc", action="store_true", help="服配叶子类目支线：监控指定叶子类目，写入专属飞书表")
     parser.add_argument("--dry-run", action="store_true", help="只采集差分，不推送")
     parser.add_argument("--mock", action="store_true", help="使用 mock 数据，跳过 Playwright")
     parser.add_argument("--list-runs", action="store_true", help="查看历史 run_id")
@@ -660,6 +952,16 @@ def main() -> None:
             logger.info("智能表格创建成功！后续采集将自动同步到智能表格。")
         else:
             logger.error("智能表格创建失败，请检查 corpid / corpsecret 配置。")
+        return
+
+    if args.acc:
+        result = asyncio.run(run_acc(dry_run=args.dry_run, mock=args.mock))
+        logger.info(
+            "=== 服配支线完成 | %d 个叶子 | %d 条商品 | %d 条事件 ===",
+            result["categories_collected"],
+            result["total_products"],
+            len(result["all_events"]),
+        )
         return
 
     if args.multi:

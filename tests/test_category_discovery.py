@@ -1,7 +1,7 @@
 import asyncio
 from unittest.mock import AsyncMock
 
-from collector.category_discovery import discover_categories
+from collector.category_discovery import discover_categories, resolve_leaf_targets
 
 
 def test_empty_target_list_discovers_all_categories():
@@ -105,4 +105,45 @@ def test_all_placeholder_at_l2_level_is_skipped():
 
     assert tree["服饰内衣"] == [
         {"name": "服装", "category_id": "1000003282", "industry_id": "4"},
+    ]
+
+
+def test_resolve_leaf_targets_uses_l2_category_id_and_leaf_id_separately():
+    raw_options = [
+        {
+            "label": "服饰内衣",
+            "value": "4",
+            "children": [
+                {
+                    "label": "服装",
+                    "value": "1000003282",
+                    "children": [
+                        {
+                            "label": "服装配饰",
+                            "value": "1000003289",
+                            "children": [
+                                {"label": "帽子", "value": "1000003461", "isLeaf": True},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    ]
+
+    targets = resolve_leaf_targets(
+        raw_options,
+        ["服饰内衣", "服装", "服装配饰"],
+        ["帽子"],
+    )
+
+    assert targets == [
+        {
+            "industry_name": "服饰内衣",
+            "category_name": "服装",
+            "leaf_name": "帽子",
+            "industry_id": "4",
+            "category_id": "1000003282",
+            "leaf_category_id": "1000003461",
+        }
     ]

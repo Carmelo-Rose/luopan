@@ -40,6 +40,12 @@ RANK_ENTRY_URL: str = os.getenv(
     "RANK_ENTRY_URL",
     "https://compass.jinritemai.com/shop/chance/merchandise-product-rank?rank_type=3",
 )
+# 榜单数据接口的路径关键字（采集器据此拦截 XHR 响应）。
+# 商品卡榜 = product_card_hot_v2；短视频榜 = video_bring_good。换榜时改这里 / .env。
+RANK_API_PATH: str = os.getenv("RANK_API_PATH", "video_bring_good")
+# 榜单 tab 名称：导航后需点击的 tab 文本（tab 是纯前端状态，不在 URL 里）。
+# 短视频榜 = "短视频榜"；留空则不点击（用页面默认 tab，如商品卡榜）。
+RANK_TAB_TEXT: str = os.getenv("RANK_TAB_TEXT", "短视频榜")
 PAGE_SIZE: int = _safe_int("PAGE_SIZE", 10)
 TOTAL_PAGES: int = _safe_int("TOTAL_PAGES", 20)
 # 固定行业类目（单类目模式，向后兼容）；留空可恢复为跟随罗盘页面当前选择。
@@ -60,6 +66,15 @@ TARGET_L1_CATEGORIES: list[str] = [
     for s in _TARGET_L1_RAW.split(",")
     if s.strip()
 ] if not TARGET_ALL_L1_CATEGORIES else []
+
+# 服配叶子类目支线：从 L1 到目标父节点的名称路径（逗号分隔）及叶子类目名。
+# 运行时从 category_raw_dump.json 解析 id，不硬编码。
+_ACC_PATH_RAW = os.getenv("ACC_PATH", "服饰内衣,服装,服装配饰")
+ACC_PATH: list[str] = [s.strip() for s in _ACC_PATH_RAW.split(",") if s.strip()]
+_ACC_LEAF_NAMES_RAW = os.getenv(
+    "ACC_LEAF_NAMES", "帽子,丝巾/披肩/头巾,面罩,防晒口罩,防晒袖套/冰袖",
+)
+ACC_LEAF_NAMES: list[str] = [s.strip() for s in _ACC_LEAF_NAMES_RAW.split(",") if s.strip()]
 
 # 类目树缓存文件路径
 CATEGORY_TREE_CACHE: str = os.getenv(
@@ -87,6 +102,9 @@ LARK_BASE_APP_TOKEN: str = os.getenv("LARK_BASE_APP_TOKEN", "")
 LARK_TABLE_ID: str = os.getenv("LARK_TABLE_ID", "")
 LARK_AS: str = os.getenv("LARK_AS", "user")  # user | bot
 
+# 服配叶子类目支线：独立飞书表（复用 LARK_BASE_APP_TOKEN / LARK_AS）
+LARK_ACC_TABLE_ID: str = os.getenv("LARK_ACC_TABLE_ID", "")
+
 # ── 企微智能表格同步（独立于 Webhook 通知）─────────────────────────────
 # 需要企业自建应用凭证（非群机器人 Webhook），配齐 4 项即自动启用。
 # corpid 在企业微信管理后台「我的企业 → 企业信息」底部获取（ww 开头）。
@@ -98,7 +116,7 @@ WECOM_SMARTSHEET_DOCID: str = os.getenv("WECOM_SMARTSHEET_DOCID", "")
 WECOM_SMARTSHEET_SHEET_ID: str = os.getenv("WECOM_SMARTSHEET_SHEET_ID", "")
 WECOM_SMARTSHEET_URL: str = os.getenv("WECOM_SMARTSHEET_URL", "")
 
-# 注：差分阈值的唯一真相源在 monitor/diff.py:_classify_rank_delta，
+# 注：差分阈值的唯一真相源在 monitor/diff.py:_classify_event，
 # 不在此处配置（曾有一份从未被引用且与硬编码不一致的死配置，已移除）。
 
 

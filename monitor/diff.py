@@ -1,17 +1,15 @@
 """
 差分引擎：对比相邻两轮快照，生成事件列表。
 
-事件优先级（互斥，同商品只触发最高优先级事件）：
-    ENTER_TOP10              上轮不在 TOP10 且本轮进入 TOP10
-    RANK_UP_50_PLUS_WARNING  delta >= 51
-    RANK_UP_30_50_WARNING    delta in [30, 50]
-    RANK_UP_20               delta in [20, 29]
-    RANK_UP_10               delta in [10, 19]
-    RANK_UP_5                delta in [5, 9]
-    NEW_ENTRY                product_id 不在上一轮榜单
+事件类型（互斥，同商品只触发最高档位事件）：
+    RANK_UP_150   delta >= 150
+    RANK_UP_100   delta in [100, 149]
+    RANK_UP_50    delta in [50, 99]
+    NEW_ENTRY     product_id 不在上一轮榜单
 
 注意：排名数值越小越好（rank=1 最优）。
       delta = rank_previous - rank_current（正数 = 排名上升）。
+      排名下跌或小幅波动（delta < 50）不触发事件。
 """
 import logging
 from datetime import datetime, timezone
@@ -24,36 +22,22 @@ EventType = str
 
 # 事件类型常量
 NEW_ENTRY = "NEW_ENTRY"
-ENTER_TOP10 = "ENTER_TOP10"
-RANK_UP_5 = "RANK_UP_5"
-RANK_UP_10 = "RANK_UP_10"
-RANK_UP_20 = "RANK_UP_20"
-RANK_UP_30_50_WARNING = "RANK_UP_30_50_WARNING"
-RANK_UP_50_PLUS_WARNING = "RANK_UP_50_PLUS_WARNING"
-
-_TOP10_THRESHOLD = 10
+RANK_UP_50 = "RANK_UP_50"
+RANK_UP_100 = "RANK_UP_100"
+RANK_UP_150 = "RANK_UP_150"
 
 
-def _classify_event(rank_cur: int, rank_prev: int, delta: int) -> Optional[EventType]:
+def _classify_event(delta: int) -> Optional[EventType]:
     """
-    按优先级匹配事件类型。
+    按 delta 分级匹配事件类型（仅数值，不涉及 TOP10 特判）。
     排名数值越小越好，delta 正数 = 排名上升。
     """
-    # 优先：冲进 TOP10
-    if rank_cur <= _TOP10_THRESHOLD and rank_prev > _TOP10_THRESHOLD:
-        return ENTER_TOP10
-
-    # 按 delta 分级
-    if delta >= 51:
-        return RANK_UP_50_PLUS_WARNING
-    if delta >= 30:
-        return RANK_UP_30_50_WARNING
-    if delta >= 20:
-        return RANK_UP_20
-    if delta >= 10:
-        return RANK_UP_10
-    if delta >= 5:
-        return RANK_UP_5
+    if delta >= 150:
+        return RANK_UP_150
+    if delta >= 100:
+        return RANK_UP_100
+    if delta >= 50:
+        return RANK_UP_50
     return None
 
 
@@ -118,7 +102,7 @@ def compute_diff(
         else:
             rank_prev = prev_map[pid]
             delta = rank_prev - rank_cur  # 正数 = 排名上升
-            event_type = _classify_event(rank_cur, rank_prev, delta)
+            event_type = _classify_event(delta)
             if event_type:
                 events.append(
                     _make_event(
@@ -154,6 +138,10 @@ def _make_event(
         "product_id": row["product_id"],
         "product_title": row.get("product_title", ""),
         "product_url": row.get("product_url", ""),
+        "image": row.get("image", ""),
+        # pay_amount 取自快照；price 由 main 在拓价后回填（默认回退脱敏价格带）
+        "pay_amount": row.get("pay_amount", ""),
+        "price": row.get("price_range", ""),
         "rank_current": rank_current,
         "rank_previous": rank_previous,
         "rank_delta": rank_delta,

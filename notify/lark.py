@@ -18,25 +18,28 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 from config import settings
-from notify.templates import group_events, format_line
+from notify.templates import group_events, format_line, EVENT_LABELS
 
 logger = logging.getLogger(__name__)
 
-# 事件类型 → 飞书表「事件类型」单选选项（与表内预设选项一致）
-_EVENT_LABELS = {
-    "NEW_ENTRY": "新进榜",
-    "ENTER_TOP10": "冲进TOP10",
-    "RANK_UP_50_PLUS_WARNING": "暴升50+",
-    "RANK_UP_30_50_WARNING": "急升30-50",
-    "RANK_UP_20": "上升20-29",
-    "RANK_UP_10": "上升10-19",
-    "RANK_UP_5": "上升5-9",
-}
+# 事件类型 → 飞书表「事件类型」单选选项（唯一真相源在 templates.EVENT_LABELS）
+_EVENT_LABELS = EVENT_LABELS
 
 # 飞书表字段顺序（必须与目标表字段名完全一致）
+# 大盘表：跨多个一级类目，故保留「一级/二级类目」两列。
 _BASE_FIELDS = [
-    "商品标题", "采集轮次", "一级类目", "二级类目", "三级类目", "叶子类目",
-    "当前排名", "上轮排名", "升幅", "事件类型",
+    "商品标题", "采集轮次", "一级类目", "二级类目",
+    "当前排名", "上轮排名", "升幅", "事件类型", "支付金额", "价格", "商品图",
+]
+
+# 服配表字段顺序：服配各叶子的一级/二级/三级类目恒为「服饰内衣/服装/服装配饰」，
+# 三列完全重复无信息量，故全部去掉，只保留「叶子类目」区分帽子/面罩/防晒口罩等
+# （叶子类目在飞书表里配成带颜色的单选标签，直观区分）。
+# 注意：写入字段必须是目标表里真实存在的列，否则整表会被清空（见 HANDOFF §4.2 同类坑），
+# 改这里前先确认 tbllW7yLiCQu606X 的列已同步删掉一级/二级/三级类目。
+_ACC_FIELDS = [
+    "商品标题", "采集轮次", "叶子类目",
+    "当前排名", "上轮排名", "升幅", "事件类型", "支付金额", "价格", "商品图",
 ]
 
 _CST = timezone(timedelta(hours=8))
@@ -60,25 +63,42 @@ def _round_label(run_id: str) -> str:
         return str(run_id)[:16]
 
 
-def _event_to_row(ev: dict, round_label: str) -> list:
-    """单条事件 → 飞书一行（顺序对齐 _BASE_FIELDS）。数值缺失写 None（空单元格）。"""
-    return [
-        ev.get("product_title", "") or "",
-        round_label,
-        ev.get("industry_name", "") or "",
-        ev.get("category_name", "") or "",
-        ev.get("category_l3_name", "") or "",
-        ev.get("leaf_category_name", "") or "",
-        ev.get("rank_current"),
-        ev.get("rank_previous"),
-        ev.get("rank_delta"),
-        _EVENT_LABELS.get(ev.get("event_type", ""), ev.get("event_type", "")),
-    ]
+def _event_value_map(ev: dict, round_label: str) -> dict:
+    """单条事件 → {飞书字段名: 值} 全量映射。各字段列表据此按需取值、排序。
+
+    数值缺失写 None（空单元格）。商品图字段为超链接(text/url)类型，直接写 URL 字符串，
+    lark-cli 会渲染成可点击链接（[url](url)）；空串=空单元格。
+    """
+    return {
+        "商品标题": ev.get("product_title", "") or "",
+        "采集轮次": round_label,
+        "一级类目": ev.get("industry_name", "") or "",
+        "二级类目": ev.get("category_name", "") or "",
+        "三级类目": ev.get("category_l3_name", "") or "",
+        "叶子类目": ev.get("leaf_category_name", "") or "",
+        "当前排名": ev.get("rank_current"),
+        "上轮排名": ev.get("rank_previous"),
+        "升幅": ev.get("rank_delta"),
+        "事件类型": _EVENT_LABELS.get(ev.get("event_type", ""), ev.get("event_type", "")),
+        "支付金额": ev.get("pay_amount", "") or "",
+        "价格": ev.get("price", "") or "",
+        "商品图": ev.get("image", "") or "",
+    }
 
 
-def _lark_batch_create(rows: list[list]) -> bool:
-    """调 lark-cli 批量写一批记录到 Base。成功返回 True。"""
-    payload = {"fields": _BASE_FIELDS, "rows": rows}
+def _event_to_row(ev: dict, round_label: str, fields: list) -> list:
+    """单条事件 → 飞书一行，顺序严格对齐传入的 fields。"""
+    vm = _event_value_map(ev, round_label)
+    return [vm.get(f) for f in fields]
+
+
+def _lark_batch_create(rows: list[list], table_id: str = "", fields: list | None = None) -> bool:
+    """调 lark-cli 批量写一批记录到 Base。成功返回 True。
+
+    fields 默认 _BASE_FIELDS（大盘）；服配传 _ACC_FIELDS。
+    """
+    tid = table_id or settings.LARK_TABLE_ID
+    payload = {"fields": fields or _BASE_FIELDS, "rows": rows}
     tmp = None
     # lark-cli 的 --json @file 只接受「当前目录内的相对路径」，故在 cwd 建临时文件、传相对名
     cwd = os.getcwd()
@@ -92,7 +112,7 @@ def _lark_batch_create(rows: list[list]) -> bool:
         cmd = (
             f'lark-cli base +record-batch-create '
             f'--base-token {settings.LARK_BASE_APP_TOKEN} '
-            f'--table-id {settings.LARK_TABLE_ID} '
+            f'--table-id {tid} '
             f'--json @"{rel}" --as {settings.LARK_AS}'
         )
         env = {**os.environ, "LARK_CLI_NO_PROXY": "1"}
@@ -121,11 +141,12 @@ def _lark_batch_create(rows: list[list]) -> bool:
                 pass
 
 
-def _lark_list_all_record_ids() -> list[str]:
+def _lark_list_all_record_ids(table_id: str = "") -> list[str]:
     """列出整表全部 record_id（按 _BASE_BATCH 分页直到 has_more=false）。
 
     失败时返回已取到的部分（调用方据「取到数 vs 实删数」判断是否清空干净）。
     """
+    tid = table_id or settings.LARK_TABLE_ID
     ids: list[str] = []
     offset = 0
     env = {**os.environ, "LARK_CLI_NO_PROXY": "1"}
@@ -133,7 +154,7 @@ def _lark_list_all_record_ids() -> list[str]:
         cmd = (
             f'lark-cli base +record-list '
             f'--base-token {settings.LARK_BASE_APP_TOKEN} '
-            f'--table-id {settings.LARK_TABLE_ID} '
+            f'--table-id {tid} '
             f'--limit {_BASE_BATCH} --offset {offset} '
             f'--format json --as {settings.LARK_AS}'
         )
@@ -165,10 +186,11 @@ def _lark_list_all_record_ids() -> list[str]:
     return ids
 
 
-def _lark_delete_records(ids: list[str]) -> int:
+def _lark_delete_records(ids: list[str], table_id: str = "") -> int:
     """按 _BASE_BATCH 分批删除给定 record_id，返回成功删除数。遇首个失败批即停。"""
     if not ids:
         return 0
+    tid = table_id or settings.LARK_TABLE_ID
     deleted = 0
     cwd = os.getcwd()
     env = {**os.environ, "LARK_CLI_NO_PROXY": "1"}
@@ -184,7 +206,7 @@ def _lark_delete_records(ids: list[str]) -> int:
             cmd = (
                 f'lark-cli base +record-delete '
                 f'--base-token {settings.LARK_BASE_APP_TOKEN} '
-                f'--table-id {settings.LARK_TABLE_ID} '
+                f'--table-id {tid} '
                 f'--json @"{rel}" --yes --as {settings.LARK_AS}'
             )
             proc = subprocess.run(
@@ -209,20 +231,22 @@ def _lark_delete_records(ids: list[str]) -> int:
     return deleted
 
 
-def _clear_base_table() -> bool:
+def _clear_base_table(table_id: str = "") -> bool:
     """清空飞书 Base 整表（覆盖模式写入前调用）。全部删除成功（或本就为空）返回 True。"""
-    ids = _lark_list_all_record_ids()
+    ids = _lark_list_all_record_ids(table_id)
     if not ids:
         logger.info("飞书 Base 当前无记录，无需清空")
         return True
-    deleted = _lark_delete_records(ids)
+    deleted = _lark_delete_records(ids, table_id)
     ok = deleted == len(ids)
     logger.info("飞书 Base 清空: 删除 %d/%d 条%s",
                 deleted, len(ids), "" if ok else "（未全部删除）")
     return ok
 
 
-def sync_events_to_base(events: list[dict], run_id: str) -> int:
+def sync_events_to_base(
+    events: list[dict], run_id: str, table_id: str = "", include_leaf: bool = False,
+) -> int:
     """
     把一轮全部异动事件写入飞书多维表格（按 _BASE_BATCH 分批）。
 
@@ -231,28 +255,42 @@ def sync_events_to_base(events: list[dict], run_id: str) -> int:
       - "append"：不清空，直接追加，保留全部历史轮次。
     返回成功写入的事件条数；遇首个失败批立即停止并返回此前已写入数（便于排障，
     不做幂等去重——每轮 run_id 唯一、事件已在 DB 层去重，正常流程不会重复写）。
-    未配置 LARK_BASE_APP_TOKEN / LARK_TABLE_ID 时跳过（返回 0）。
+    未配置 LARK_BASE_APP_TOKEN / table_id 时跳过（返回 0）。
+
+    Parameters
+    ----------
+    table_id : str
+        目标飞书表 id，默认使用 settings.LARK_TABLE_ID（大盘表）。
+        服配支线传 settings.LARK_ACC_TABLE_ID。
+    include_leaf : bool
+        True 时使用服配字段集 _ACC_FIELDS（无一级/二级/三级类目，仅「叶子类目」单选标签列）。
+        大盘表必须 False（使用 _BASE_FIELDS，含一级/二级类目）。
     """
     if not events:
         return 0
-    if not (settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID):
-        logger.info("未配置 LARK_BASE_APP_TOKEN / LARK_TABLE_ID，跳过飞书 Base 同步")
+    tid = table_id or settings.LARK_TABLE_ID
+    if not (settings.LARK_BASE_APP_TOKEN and tid):
+        logger.info("未配置 LARK_BASE_APP_TOKEN / table_id，跳过飞书 Base 同步")
         return 0
 
+    fields = _ACC_FIELDS if include_leaf else _BASE_FIELDS
     # 每行按事件自身 run_id 打轮次标签（events 可能跨两轮——含上一轮补发的残留），
     # 缺失时回退到本轮 run_id。
-    rows = [_event_to_row(e, _round_label(e.get("run_id") or run_id)) for e in events]
+    rows = [
+        _event_to_row(e, _round_label(e.get("run_id") or run_id), fields)
+        for e in events
+    ]
 
     # ── 覆盖模式：写入前清空整表，使 Base 只保留最新一轮 ──────────────
     # append 模式跳过这步，下面的批量新建即为旧的「叠加追加」行为。
     if _BASE_WRITE_MODE == "overwrite":
-        if not _clear_base_table():
+        if not _clear_base_table(tid):
             logger.warning("飞书 Base 清空未完全成功，仍继续写入本轮（可能与残留旧数据并存）")
 
     written = 0
     for i in range(0, len(rows), _BASE_BATCH):
         batch = rows[i:i + _BASE_BATCH]
-        if not _lark_batch_create(batch):
+        if not _lark_batch_create(batch, tid, fields=fields):
             logger.warning("飞书 Base 第 %d 批写入失败，已写入 %d 条后停止", i // _BASE_BATCH + 1, written)
             break
         written += len(batch)

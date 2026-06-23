@@ -1,9 +1,9 @@
 """
-抖音罗盘「商品卡榜」采集模块。
+抖音罗盘商品榜采集模块（V2 默认短视频榜）。
 
 采集策略：
   - 使用 persistent_context 复用已登录 Chrome profile
-  - 导航至真实榜单页，监听 XHR 响应拦截 product_card_hot_v2 接口
+  - 导航至真实榜单页，监听 XHR 响应拦截配置的榜单接口
   - 接口拦截失败时降级为 DOM 解析（tr 行）
   - 翻页方式：直接调用接口 page_no 参数（不点击翻页按钮），每页拦截一次响应
 """
@@ -29,11 +29,24 @@ logger = logging.getLogger(__name__)
 _RANK_ENTRY_URL = settings.RANK_ENTRY_URL
 
 # ── 数据接口路径关键词 ─────────────────────────────────────────────────
-_API_PATH = "product_card_hot_v2"
+# 从 settings 读取（可经 .env 的 RANK_API_PATH 覆盖），换榜时无需改代码。
+_API_PATH = settings.RANK_API_PATH
 
 
 def _is_rank_api(url: str) -> bool:
     return _API_PATH in url
+
+
+def _extract_cards(payload: dict) -> list:
+    """从接口响应里取榜单条目列表，兼容不同榜单的 list 键。
+
+    商品卡榜响应是 data.card_list；短视频榜（video_bring_good）是 data.data_result。
+    """
+    data = payload.get("data", {}) or {}
+    cards = data.get("card_list")
+    if cards is None:
+        cards = data.get("data_result")
+    return cards if isinstance(cards, list) else []
 
 
 # 浏览器自管理的请求头，fetch 时不应手动设置
@@ -144,6 +157,8 @@ def _parse_card(
             f"https://haohuo.jinritemai.com/ecommerce/trade/detail/index.html"
             f"?id={product_id}&origin_type=pc_compass_manage"
         )
+    # 短视频榜字段是 image_url，商品卡榜是 image
+    image = info.get("image_url", "") or info.get("image", "")
     price_range = info.get("price_bin", "") or _range_str(info.get("price"))
 
     pay_amount = _range_str(card.get("pay_amt"))
@@ -156,6 +171,7 @@ def _parse_card(
         "product_id": product_id,
         "product_title": product_title,
         "product_url": product_url,
+        "image": image,
         "price_range": price_range,
         "pay_amount": pay_amount,
         "clicks": clicks,
@@ -300,6 +316,7 @@ async def _parse_dom_rows(
             "product_id": product_id,
             "product_title": product_title,
             "product_url": url,
+            "image": "",
             "price_range": "",
             "pay_amount": pay_amount,
             "clicks": clicks,
@@ -321,7 +338,7 @@ async def _parse_dom_rows(
 
 class DouyinCompassCollector:
     """
-    抖音罗盘商品卡榜采集器。
+    抖音罗盘商品榜采集器。
 
     用法::
 
@@ -610,6 +627,31 @@ class DouyinCompassCollector:
 
         return results
 
+    async def _select_rank_tab(self, page: Page) -> None:
+        """导航后点击目标榜单 tab（settings.RANK_TAB_TEXT），如「短视频榜」。
+
+        tab 是纯前端状态、不进 URL，必须点击才能让 SPA 触发对应榜单接口。
+        点击是 best-effort：留空配置则跳过；点不到只告警不阻断（回退默认 tab）。
+        点击后顺带点「实时」以贴近目标维度（date_type 最终仍由 URL 覆盖兜底）。
+        """
+        tab_text = settings.RANK_TAB_TEXT
+        if not tab_text:
+            return
+        for label in (tab_text, "实时"):
+            clicked = False
+            for sel in (f'text="{label}"', f'text={label}'):
+                try:
+                    await page.locator(sel).first.click(timeout=4000)
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if clicked:
+                logger.info("已点击榜单 tab: %s", label)
+                await asyncio.sleep(2)
+            elif label == tab_text:
+                logger.warning("未能点击榜单 tab「%s」，将回退页面默认 tab", label)
+
     async def _collect_page1(
         self,
         page: Page,
@@ -637,9 +679,9 @@ class DouyinCompassCollector:
                     body = await resp.json()
                 except Exception:
                     return
-                card_list = body.get("data", {}).get("card_list", [])
-                if not isinstance(card_list, list) or not card_list:
-                    logger.debug("跳过空/无效响应（无 card_list）: %s", resp.url)
+                card_list = _extract_cards(body)
+                if not card_list:
+                    logger.debug("跳过空/无效响应（无榜单条目）: %s", resp.url)
                     return
                 captured_url = resp.url
                 try:
@@ -668,6 +710,9 @@ class DouyinCompassCollector:
             if not _reuse_page:
                 logger.info("导航至榜单页: %s", self.rank_url)
                 await page.goto(self.rank_url, wait_until="domcontentloaded", timeout=60000)
+                # 榜单 tab 是纯前端状态、不在 URL 里：导航后点击目标 tab（如「短视频榜」），
+                # 否则 SPA 只会自动触发默认 tab（商品卡榜）的接口，捕获不到目标榜单。
+                await self._select_rank_tab(page)
                 # 首次加载：等待 SPA 自动触发 API（最多 20s）
                 for _ in range(40):
                     if captured_url:
@@ -801,11 +846,13 @@ class DouyinCompassCollector:
                 )
                 return None
 
-        card_list = data.get("data", {}).get("card_list", [])
-        if not isinstance(card_list, list):
-            logger.error("第 %d 页 card_list 结构异常", page_no)
-            return None
+        card_list = _extract_cards(data)
         if not card_list:
+            # 区分「结构异常」与「合法空页」：data 下两个 list 键都不存在 → 异常
+            d = data.get("data", {}) or {}
+            if "card_list" not in d and "data_result" not in d:
+                logger.error("第 %d 页榜单条目结构异常", page_no)
+                return None
             return []
         return _parse_card_list(
             card_list, page_no, self.page_size, scope_key, captured_at,

@@ -28,10 +28,14 @@ _COLUMN_MIGRATIONS = [
     ("products_snapshot", "category_name"),
     ("products_snapshot", "category_l3_name"),
     ("products_snapshot", "leaf_category_name"),
+    ("products_snapshot", "image"),
     ("ranking_event", "industry_name"),
     ("ranking_event", "category_name"),
     ("ranking_event", "category_l3_name"),
     ("ranking_event", "leaf_category_name"),
+    ("ranking_event", "image"),
+    ("ranking_event", "pay_amount"),
+    ("ranking_event", "price"),
 ]
 
 
@@ -57,19 +61,19 @@ def insert_snapshot(conn: sqlite3.Connection, run_id: str, rows: list[dict]) -> 
     sql = """
         INSERT OR IGNORE INTO products_snapshot
             (run_id, scope_key, rank, product_id, product_title, product_url,
-             price_range, pay_amount, clicks, conversion_rate,
+             image, price_range, pay_amount, clicks, conversion_rate,
              card_order_count, captured_at, industry_name, category_name,
              category_l3_name, leaf_category_name)
         VALUES
             (:run_id, :scope_key, :rank, :product_id, :product_title, :product_url,
-             :price_range, :pay_amount, :clicks, :conversion_rate,
+             :image, :price_range, :pay_amount, :clicks, :conversion_rate,
              :card_order_count, :captured_at,
              COALESCE(:industry_name, ''), COALESCE(:category_name, ''),
              COALESCE(:category_l3_name, ''), COALESCE(:leaf_category_name, ''))
     """
     # 防御性默认：旧调用方/测试可能不带新字段，统一补空避免绑定缺参
     data = [
-        {"category_l3_name": "", "leaf_category_name": "", **r, "run_id": run_id}
+        {"category_l3_name": "", "leaf_category_name": "", "image": "", **r, "run_id": run_id}
         for r in rows
     ]
     conn.executemany(sql, data)
@@ -138,6 +142,27 @@ def get_latest_run_ids(conn: sqlite3.Connection, limit: int = 2) -> list[str]:
     return [r["run_id"] for r in rows]
 
 
+def get_latest_run_ids_for_prefix(
+    conn: sqlite3.Connection, scope_prefix: str, limit: int = 2
+) -> list[str]:
+    """返回某 scope_key 前缀下最近 limit 个 run_id，降序。
+
+    与 get_latest_run_ids（全局）不同：当多条独立管线（如大盘 video_order_* 与
+    服配 video_acc_*）各自排程、run_id 交错写入同一张快照表时，全局「最近两轮」
+    会被另一条管线的轮次挤占，导致本管线上一轮未送达的事件掉出补发窗口而永久滞留。
+    本函数按前缀隔离窗口，使每条管线的中断补发只看自己的最近两轮。
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT run_id FROM products_snapshot
+        WHERE scope_key LIKE ?
+        ORDER BY run_id DESC LIMIT ?
+        """,
+        (scope_prefix + "%", limit),
+    ).fetchall()
+    return [r["run_id"] for r in rows]
+
+
 # ── 事件写入 ──────────────────────────────────────────────────────────
 
 def insert_events(conn: sqlite3.Connection, events: list[dict]) -> int:
@@ -153,23 +178,49 @@ def insert_events(conn: sqlite3.Connection, events: list[dict]) -> int:
     sql = """
         INSERT OR IGNORE INTO ranking_event
             (run_id, scope_key, event_type, product_id, product_title, product_url,
-             rank_current, rank_previous, rank_delta, created_at, notified,
+             rank_current, rank_previous, rank_delta, image, pay_amount, price,
+             created_at, notified,
              industry_name, category_name, category_l3_name, leaf_category_name)
         VALUES
             (:run_id, :scope_key, :event_type, :product_id, :product_title, :product_url,
-             :rank_current, :rank_previous, :rank_delta, :created_at, 0,
+             :rank_current, :rank_previous, :rank_delta, :image, :pay_amount, :price,
+             :created_at, 0,
              COALESCE(:industry_name, ''), COALESCE(:category_name, ''),
              COALESCE(:category_l3_name, ''), COALESCE(:leaf_category_name, ''))
     """
     # 防御性默认：旧调用方/测试可能不带新字段，统一补空避免绑定缺参
     data = [
-        {"category_l3_name": "", "leaf_category_name": "", **e}
+        {"category_l3_name": "", "leaf_category_name": "",
+         "image": "", "pay_amount": "", "price": "", **e}
         for e in events
     ]
     before = conn.total_changes
     conn.executemany(sql, data)
     conn.commit()
     return conn.total_changes - before
+
+
+def update_event_prices(
+    conn: sqlite3.Connection, run_id: str, price_map: dict[str, str]
+) -> int:
+    """把详情页抓到的真实价格回填到本轮已落库事件。返回更新行数。
+
+    price_map: {product_id: "¥59.9起"}。只更新本 run_id 的事件，抓不到的商品不动
+    （保留 insert 时写入的 price_bin 回退值）。
+    """
+    if not price_map:
+        return 0
+    updated = 0
+    for pid, price in price_map.items():
+        if not price:
+            continue
+        cur = conn.execute(
+            "UPDATE ranking_event SET price=? WHERE run_id=? AND product_id=?",
+            (price, run_id, pid),
+        )
+        updated += cur.rowcount
+    conn.commit()
+    return updated
 
 
 def get_pending_events(conn: sqlite3.Connection) -> list[dict]:
