@@ -424,21 +424,23 @@ async def run_multi(
         #         updated = database.update_event_prices(conn, run_id, price_map)
         #         logger.info("详情页价格回填 DB: %d 条", updated)
 
-        # ── 飞书 Base 同步：采集即写（与企微推送时序解耦）────────────────────
-        # 让在线表在「采集完—延后推送」的等待窗口内就是最新数据，而非等到 flush 才更新。
-        # overwrite 模式幂等：flush 里仍保留同步作为兜底，同一批事件重写结果一致。
+        # ── 飞书快照表：采集即写（每轮一张独立表，名如「大盘表6.30-16时00」）──────
+        # 大盘异动每轮生成一张独立飞书表，完整复刻模板 schema（含带色单选 + 排名趋势
+        # 公式列），保留本周全部、周一清上周（见 notify.lark.create_and_write_snapshot）。
+        # 关键：只写「本轮 run_id」的事件——每张表是该轮快照，不并入上一轮残留（否则
+        # 上一轮事件会重复进本轮表）。中断漏掉的一轮就少一张表，不跨轮补写。
+        # 服配支线不走这里，仍用 sync_events_to_base 的 overwrite（见 run_acc）。
         if not dry_run:
-            # 按 video_order 前缀隔离，避免把交错运行的服配(video_acc)事件卷进大盘飞书表
-            recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
-            to_sync = [
+            this_round = [
                 e for e in database.get_pending_events(conn)
-                if e.get("run_id") in recent_runs
+                if e.get("run_id") == run_id
                 and (e.get("scope_key") or "").startswith(scope_prefix)
             ]
-            if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
-                from notify.lark import sync_events_to_base
-                written = sync_events_to_base(to_sync, run_id)
-                logger.info("飞书 Base 同步（采集即写）: 写入 %d / %d 条事件", written, len(to_sync))
+            if this_round and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
+                from notify.lark import create_and_write_snapshot
+                snap_tid = create_and_write_snapshot(this_round, run_id)
+                logger.info("飞书快照表（采集即写）: %s（%d 条事件）",
+                            snap_tid or "创建失败", len(this_round))
 
         # ── 推送 + 同步 ──────────────────────────────────────────
         # 关键：以「数据库里仍待送达的事件」为准，而非仅本进程内存中的 all_events。
@@ -627,10 +629,13 @@ def _dispatch_summary(
     """多类目模式：只推送企微摘要（含在线表格链接），不逐条推送事件。"""
     from notify.wecom import send_summary
 
-    # 构建在线表格链接
+    # 构建在线表格链接：指向本轮刚生成的快照表（最新一张）；无快照时回退到 LARK_TABLE_ID
     lark_url = ""
-    if settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
-        lark_url = f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}?table={settings.LARK_TABLE_ID}"
+    if settings.LARK_BASE_APP_TOKEN:
+        from notify.lark import latest_snapshot_table_id
+        link_tid = latest_snapshot_table_id() or settings.LARK_TABLE_ID
+        if link_tid:
+            lark_url = f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}?table={link_tid}"
 
     wecom_sheet_url = settings.WECOM_SMARTSHEET_URL
 
