@@ -200,6 +200,8 @@ async def run_multi(
     dry_run: bool = False,
     mock: bool = False,
     scope_prefix: str = "video_order",
+    do_collect: bool = True,
+    do_push: bool = True,
 ) -> dict:
     """
     多类目模式：自动发现目标一级类目下所有二级类目，逐个采集并生成报告。
@@ -229,6 +231,21 @@ async def run_multi(
     category_results: list[dict] = []
 
     try:
+        if not do_collect:
+            # flush 模式：不采集，仅把 DB 中待送达事件推出去（读 sidecar 还原摘要上下文）
+            sc = _load_summary_sidecar("multi") or {}
+            f_run_id = sc.get("run_id", run_id)
+            f_ts = sc.get("ts", ts)
+            f_cat = sc.get("categories_collected", 0)
+            f_cr = sc.get("category_results", [])
+            if not dry_run:
+                excel_path = _finalize_multi_push(conn, f_run_id, f_ts, f_cat, f_cr)
+            logger.info("═══ flush 推送完成（多类目）═══")
+            return {
+                "run_id": f_run_id, "categories_collected": f_cat,
+                "total_products": 0, "all_events": [], "excel_path": excel_path,
+            }
+
         if mock:
             # Mock 模式：为每个目标 L1 生成 2 个 L2 的 mock 数据
             categories = []
@@ -407,6 +424,22 @@ async def run_multi(
         #         updated = database.update_event_prices(conn, run_id, price_map)
         #         logger.info("详情页价格回填 DB: %d 条", updated)
 
+        # ── 飞书 Base 同步：采集即写（与企微推送时序解耦）────────────────────
+        # 让在线表在「采集完—延后推送」的等待窗口内就是最新数据，而非等到 flush 才更新。
+        # overwrite 模式幂等：flush 里仍保留同步作为兜底，同一批事件重写结果一致。
+        if not dry_run:
+            # 按 video_order 前缀隔离，避免把交错运行的服配(video_acc)事件卷进大盘飞书表
+            recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
+            to_sync = [
+                e for e in database.get_pending_events(conn)
+                if e.get("run_id") in recent_runs
+                and (e.get("scope_key") or "").startswith(scope_prefix)
+            ]
+            if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
+                from notify.lark import sync_events_to_base
+                written = sync_events_to_base(to_sync, run_id)
+                logger.info("飞书 Base 同步（采集即写）: 写入 %d / %d 条事件", written, len(to_sync))
+
         # ── 推送 + 同步 ──────────────────────────────────────────
         # 关键：以「数据库里仍待送达的事件」为准，而非仅本进程内存中的 all_events。
         # 推送/同步排在整轮采集之后，若上一轮在中途被硬杀（没走到这一步），其已落库的
@@ -420,32 +453,17 @@ async def run_multi(
                             e["event_type"], e.get("industry_name", ""),
                             e.get("category_name", ""), e["rank_current"],
                             e["product_title"][:30])
+        elif not do_push:
+            # --no-push：采集已入库（事件 notified=0），落盘摘要上下文，待 --flush 推送
+            _save_summary_sidecar(
+                "multi", run_id, ts, categories_collected, category_results,
+                scope_prefix=scope_prefix, new_event_count=len(all_events),
+            )
         else:
-            recent_runs = set(database.get_latest_run_ids(conn, 2))
-            to_send = [
-                e for e in database.get_pending_events(conn)
-                if e.get("run_id") in recent_runs
-            ]
-            backlog = len(to_send) - len(all_events)
-            if backlog > 0:
-                logger.info("检测到上一轮未送达事件 %d 条，本轮一并补发", backlog)
-
-            report_dir = os.path.join(settings.BASE_DIR, "data", "reports")
-            excel_path = generate_report(
-                to_send, report_dir, timestamp=ts,
-                category_results=category_results,
+            excel_path = _finalize_multi_push(
+                conn, run_id, ts, categories_collected, category_results,
+                collected_event_count=len(all_events),
             )
-
-            _dispatch_summary(
-                conn, to_send, categories_collected, ts,
-                category_results=category_results,
-            )
-
-            # ── 飞书多维表格同步（独立于企微通知，配齐 token 才执行）──────
-            if to_send and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
-                from notify.lark import sync_events_to_base
-                written = sync_events_to_base(to_send, run_id)
-                logger.info("飞书 Base 同步: 写入 %d / %d 条事件", written, len(to_send))
 
             # ── 企微智能表格同步（已停用，2026-06-23）─────────────────────
             # 运营决定异动数据统一落飞书表（大盘表 + 服配表），企微侧只保留 Webhook 摘要
@@ -637,6 +655,139 @@ def _dispatch_summary(
         logger.info("摘要模式: 标记 %d 条事件为已通知", len(ids))
 
 
+# ── 延后推送：采集(--no-push)与推送(--flush)解耦 ──────────────────────────
+# --no-push 采集入库后把摘要所需上下文（时间戳/类目数/覆盖明细）落到 sidecar，
+# --flush 不采集，仅读 sidecar 还原摘要并把 DB 中 notified=0 的待送达事件推出去。
+# 用于「采集在原定时间跑、推送延后半小时」的定时编排（见 run_multi_then_acc.ps1）。
+
+def _summary_sidecar_path(lane: str) -> str:
+    return os.path.join(settings.BASE_DIR, "data", f"pending_summary_{lane}.json")
+
+
+def _save_summary_sidecar(
+    lane: str, run_id: str, ts: datetime,
+    categories_collected: int, category_results: list[dict],
+    scope_prefix: str = "", new_event_count: int = 0,
+) -> None:
+    """采集完成（--no-push）后落盘摘要上下文，供后续 --flush 还原推送。"""
+    data = {
+        "run_id": run_id,
+        "ts": ts.isoformat(),
+        "categories_collected": categories_collected,
+        "category_results": category_results,
+        "scope_prefix": scope_prefix,
+    }
+    try:
+        with open(_summary_sidecar_path(lane), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        logger.info(
+            "[%s] --no-push 采集入库完成，%d 条新事件待 flush 推送", lane, new_event_count,
+        )
+    except Exception as e:
+        logger.warning("[%s] 写入待推送 sidecar 失败: %s", lane, e)
+
+
+def _load_summary_sidecar(lane: str) -> dict | None:
+    """读取 --no-push 落盘的摘要上下文；缺失/损坏返回 None。"""
+    try:
+        with open(_summary_sidecar_path(lane), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["ts"] = datetime.fromisoformat(data["ts"])
+        return data
+    except FileNotFoundError:
+        logger.warning("[%s] 未找到待推送 sidecar（无 --no-push 采集？），按空摘要推送", lane)
+        return None
+    except Exception as e:
+        logger.warning("[%s] 读取待推送 sidecar 失败: %s，按空摘要推送", lane, e)
+        return None
+
+
+def _finalize_multi_push(
+    conn, run_id: str, ts: datetime,
+    categories_collected: int, category_results: list[dict],
+    collected_event_count: int = 0,
+    scope_prefix: str = "video_order",
+) -> str:
+    """大盘推送 + 同步：以 DB 中待送达事件为准，生成 Excel、推企微摘要、同步飞书表。
+
+    正常采集路径与 --flush 路径共用本函数。返回 Excel 报告路径。
+    """
+    # 必须按大盘前缀隔离：延后推送下，服配(video_acc)的 run_id 往往比大盘更新，
+    # 用全局 get_latest_run_ids 会把服配事件卷进大盘摘要、推到大盘群并标记已通知，
+    # 导致服配 flush 捞不到事件、服配群漏推。前缀隔离与 _finalize_acc_push 对称。
+    recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
+    to_send = [
+        e for e in database.get_pending_events(conn)
+        if e.get("run_id") in recent_runs
+        and (e.get("scope_key") or "").startswith(scope_prefix)
+    ]
+    backlog = len(to_send) - collected_event_count
+    if backlog > 0:
+        logger.info("检测到上一轮未送达事件 %d 条，本轮一并补发", backlog)
+
+    report_dir = os.path.join(settings.BASE_DIR, "data", "reports")
+    excel_path = generate_report(
+        to_send, report_dir, timestamp=ts,
+        category_results=category_results,
+    )
+
+    _dispatch_summary(
+        conn, to_send, categories_collected, ts,
+        category_results=category_results,
+    )
+
+    # 飞书 Base 已在采集阶段写入（见 run_multi 采集后的「采集即写」），此处不再重复写。
+    return excel_path
+
+
+def _finalize_acc_push(
+    conn, run_id: str, ts: datetime,
+    categories_collected: int, scope_prefix: str,
+    collected_event_count: int = 0,
+) -> None:
+    """服配推送 + 同步：服配企微群 + 服配飞书表（不生成 Excel、不写企微智能表格）。
+
+    正常采集路径与 --flush 路径共用本函数。补发窗口按 scope_prefix 前缀隔离。
+    """
+    recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
+    to_send = [
+        e for e in database.get_pending_events(conn)
+        if e.get("run_id") in recent_runs
+        and (e.get("scope_key") or "").startswith(scope_prefix)
+    ]
+    backlog = len(to_send) - collected_event_count
+    if backlog > 0:
+        logger.info("检测到上一轮未送达事件 %d 条，本轮一并补发", backlog)
+
+    # 飞书 Base 已在采集阶段写入（见 run_acc 采集后的「采集即写」），此处不再重复写。
+    wecom_ok = False
+    if to_send:
+        from notify.wecom import send_summary
+        lark_url = ""
+        if settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
+            lark_url = (
+                f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}"
+                f"?table={settings.LARK_ACC_TABLE_ID}"
+            )
+        wecom_ok = send_summary(
+            settings.WECOM_ACC_WEBHOOK_URL,
+            events=to_send,
+            categories_count=categories_collected,
+            timestamp=ts,
+            category_results=[],
+            lark_url=lark_url,
+            wecom_sheet_url="",
+        )
+        logger.info("服配企微摘要推送: %s（%d 条事件）", "成功" if wecom_ok else "失败", len(to_send))
+
+    # 企微推送成功才标记（飞书已在采集阶段写入，不再纳入此处门槛）；失败则保留待下轮补发。
+    if to_send and wecom_ok:
+        ids = [e["id"] for e in to_send if e.get("id") is not None]
+        if ids:
+            database.mark_events_notified(conn, ids)
+            logger.info("服配支线: 标记 %d 条事件为已通知", len(ids))
+
+
 # ── CLI ───────────────────────────────────────────────────────────────
 
 async def do_login() -> None:
@@ -705,7 +856,10 @@ def _process_category(
     return events, cat_total, "有异动" if events else "无异动"
 
 
-async def run_acc(dry_run: bool = False, mock: bool = False) -> dict:
+async def run_acc(
+    dry_run: bool = False, mock: bool = False,
+    do_collect: bool = True, do_push: bool = True,
+) -> dict:
     """
     服配叶子类目支线：监控指定叶子类目的榜单异动，写入专属飞书表。
 
@@ -720,6 +874,25 @@ async def run_acc(dry_run: bool = False, mock: bool = False) -> dict:
     ts = datetime.now()
     scope_prefix = "video_acc"
     logger.info("═══ 服配支线 run_id: %s ═══", run_id)
+
+    if not do_collect:
+        # flush 模式：不采集叶子，仅把 DB 中待送达的服配事件推出去（读 sidecar 还原摘要）
+        database.init_db(settings.DB_PATH)
+        conn = database.get_connection(settings.DB_PATH)
+        try:
+            sc = _load_summary_sidecar("acc") or {}
+            f_run_id = sc.get("run_id", run_id)
+            f_ts = sc.get("ts", ts)
+            f_cat = sc.get("categories_collected", 0)
+            if not dry_run:
+                _finalize_acc_push(conn, f_run_id, f_ts, f_cat, scope_prefix)
+            logger.info("═══ flush 推送完成（服配支线）═══")
+            return {
+                "run_id": f_run_id, "categories_collected": f_cat,
+                "total_products": 0, "all_events": [],
+            }
+        finally:
+            conn.close()
 
     # ── 解析叶子目标 ──────────────────────────────────────────────────
     if mock:
@@ -778,12 +951,7 @@ async def run_acc(dry_run: bool = False, mock: bool = False) -> dict:
                 # 预热：先做一次冷导航建立 base API URL + 选中「短视频榜」tab。
                 # 实测首个叶子若走冷启动（_reuse_page=False）拿不到数据，故先预热再
                 # 逐叶子以 _reuse_page=True 直采，让 SPA 按完整类目路径原生加载叶子榜。
-                #
-                # 关键坑（2026-06-23 排查）：预热必须用「父级路径」(L2,L3 去掉叶子)，
-                # 不能用 targets[0] 的完整叶子路径。否则预热已把第一个叶子(targets[0])的
-                # 路径加载好，循环首轮再对同一路径 _reuse_page=True 不会触发新的 XHR，
-                # 该叶子拿 0 条被跳过（曾误判为「面罩无短视频榜」——其实 UI 确认面罩有榜，
-                # 只是它恰好是 targets[0]）。用父级路径预热，循环里每个叶子都是全新路径→新 XHR。
+                # 预热用「父级路径」(L2,L3 去掉叶子)，与各叶子路径都不同，纯粹建链不抢叶子。
                 warm = targets[0]
                 warm_path = ",".join(warm["rank_category_id"].split(",")[:-1]) or warm["rank_category_id"]
                 try:
@@ -805,22 +973,35 @@ async def run_acc(dry_run: bool = False, mock: bool = False) -> dict:
                         "═══ [%d/%d] 服配叶子直采 %s（path=%s）═══",
                         idx, total, target["leaf_name"], target["rank_category_id"],
                     )
-                    try:
-                        # 关键：category_id 传完整路径 L2,L3,叶子 → 直接拉该叶子专属 TOP200
-                        products = await collector.collect(
-                            scope_key=scope_key,
-                            industry_id=target["industry_id"],
-                            category_id=target["rank_category_id"],
-                            industry_name=target["industry_name"],
-                            category_name=target["category_name"],
-                            _reuse_page=True,
-                        )
-                    except Exception as e:
-                        logger.error("[%s] 采集异常: %s", scope_key, e)
-                        continue
+                    # 0 条时重试一次，兜底网络抖动/偶发空页等瞬时失败（此时页面已热）。
+                    # 注：面罩长期「返回 0」的真因不是瞬时失败，而是它的榜单天然只有 156 条 <
+                    # 大盘下限 160 被误判残缺——已由上面 min_products=1 修掉，这里的重试只兜真瞬时 0。
+                    products = []
+                    for attempt in range(2):
+                        try:
+                            # 关键：category_id 传完整路径 L2,L3,叶子 → 直接拉该叶子专属 TOP200
+                            products = await collector.collect(
+                                scope_key=scope_key,
+                                industry_id=target["industry_id"],
+                                category_id=target["rank_category_id"],
+                                industry_name=target["industry_name"],
+                                category_name=target["category_name"],
+                                _reuse_page=True,
+                                # 服配叶子榜天然可能 <160（面罩仅 156），不能套大盘的 160 下限，
+                                # 否则会被误判残缺丢弃。中途页失败仍由 collection_failed 兜底。
+                                min_products=1,
+                            )
+                        except Exception as e:
+                            logger.error("[%s] 采集异常（第 %d 次）: %s", scope_key, attempt + 1, e)
+                            products = []
+                        if products:
+                            break
+                        if attempt == 0:
+                            logger.warning("[%s] 返回 0 条，2s 后重试一次（疑似首叶空窗）", scope_key)
+                            await asyncio.sleep(2)
 
                     if not products:
-                        logger.warning("[%s] 该叶子短视频榜返回 0 条，跳过", scope_key)
+                        logger.warning("[%s] 重试后仍返回 0 条，跳过", scope_key)
                         continue
 
                     # 直采结果已是该叶子专属榜；强制回填叶子名（避免 lookup 索引缺失时为空）
@@ -844,6 +1025,22 @@ async def run_acc(dry_run: bool = False, mock: bool = False) -> dict:
         # 配饰监控用脱敏价格带（price_bin，如 ¥59.9-¥89.9）已够用。价格列即 compute_diff
         # 写入的 price_range 回退值，无需回填。支付金额/商品图不受影响，照常落表。
 
+        # ── 服配飞书 Base 同步：采集即写（与企微推送时序解耦，等待窗口内表即最新）──
+        # overwrite 模式幂等：flush 里仍保留同步作为兜底，同一批事件重写结果一致。
+        if not dry_run:
+            recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
+            to_sync = [
+                e for e in database.get_pending_events(conn)
+                if e.get("run_id") in recent_runs
+                and (e.get("scope_key") or "").startswith(scope_prefix)
+            ]
+            if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
+                from notify.lark import sync_events_to_base
+                written = sync_events_to_base(
+                    to_sync, run_id, table_id=settings.LARK_ACC_TABLE_ID, include_leaf=True,
+                )
+                logger.info("服配飞书 Base 同步（采集即写）: 写入 %d / %d 条事件", written, len(to_sync))
+
         # ── 推送：服配企微消息 + 服配飞书表；不写企微智能表格，不生成 Excel ──
         if dry_run:
             logger.info("[DRY-RUN] 跳过企微推送与飞书写入，共 %d 条事件", len(all_events))
@@ -851,55 +1048,17 @@ async def run_acc(dry_run: bool = False, mock: bool = False) -> dict:
                 logger.info("  [%s] %s rank=%s %s",
                             e["event_type"], e.get("leaf_category_name", "") or e.get("category_name", ""),
                             e["rank_current"], e["product_title"][:30])
+        elif not do_push:
+            # --no-push：采集已入库（事件 notified=0），落盘摘要上下文，待 --flush 推送
+            _save_summary_sidecar(
+                "acc", run_id, ts, categories_collected, [],
+                scope_prefix=scope_prefix, new_event_count=len(all_events),
+            )
         else:
-            # 补发窗口按 video_acc 前缀隔离，避免被大盘轮次挤出窗口（见 database 注释）
-            recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
-            to_send = [
-                e for e in database.get_pending_events(conn)
-                if e.get("run_id") in recent_runs
-                and (e.get("scope_key") or "").startswith(scope_prefix)
-            ]
-            backlog = len(to_send) - len(all_events)
-            if backlog > 0:
-                logger.info("检测到上一轮未送达事件 %d 条，本轮一并补发", backlog)
-
-            lark_ok = False
-            if to_send and settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
-                from notify.lark import sync_events_to_base
-                written = sync_events_to_base(
-                    to_send, run_id, table_id=settings.LARK_ACC_TABLE_ID, include_leaf=True,
-                )
-                logger.info("服配飞书 Base 同步: 写入 %d / %d 条事件", written, len(to_send))
-                lark_ok = written == len(to_send)
-            elif to_send and not settings.LARK_ACC_TABLE_ID:
-                logger.warning("未配置 LARK_ACC_TABLE_ID，跳过服配飞书同步（事件保留待下轮补发）")
-
-            wecom_ok = False
-            if to_send:
-                from notify.wecom import send_summary
-                lark_url = ""
-                if settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
-                    lark_url = (
-                        f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}"
-                        f"?table={settings.LARK_ACC_TABLE_ID}"
-                    )
-                wecom_ok = send_summary(
-                    settings.WECOM_WEBHOOK_URL,
-                    events=to_send,
-                    categories_count=categories_collected,
-                    timestamp=ts,
-                    category_results=[],
-                    lark_url=lark_url,
-                    wecom_sheet_url="",
-                )
-                logger.info("服配企微摘要推送: %s（%d 条事件）", "成功" if wecom_ok else "失败", len(to_send))
-
-            # 企微 + 飞书都成功才标记，任一失败都保留待下轮补发。
-            if to_send and lark_ok and wecom_ok:
-                ids = [e["id"] for e in to_send if e.get("id") is not None]
-                if ids:
-                    database.mark_events_notified(conn, ids)
-                    logger.info("服配支线: 标记 %d 条事件为已通知", len(ids))
+            _finalize_acc_push(
+                conn, run_id, ts, categories_collected, scope_prefix,
+                collected_event_count=len(all_events),
+            )
 
         logger.info(
             "═══ 服配支线完成 | %d 个叶子 | %d 条商品 | %d 条事件 ═══",
@@ -922,6 +1081,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--multi", action="store_true", help="多类目模式：自动发现并遍历所有目标类目")
     parser.add_argument("--acc", action="store_true", help="服配叶子类目支线：监控指定叶子类目，写入专属飞书表")
     parser.add_argument("--dry-run", action="store_true", help="只采集差分，不推送")
+    parser.add_argument("--no-push", action="store_true", help="只采集入库（事件待送达），不推送；配合 --flush 实现延后推送")
+    parser.add_argument("--flush", action="store_true", help="不采集，仅把 DB 中待送达事件推出去（延后推送的第二步）")
     parser.add_argument("--mock", action="store_true", help="使用 mock 数据，跳过 Playwright")
     parser.add_argument("--list-runs", action="store_true", help="查看历史 run_id")
     parser.add_argument("--login", action="store_true", help="打开浏览器手动登录，保存登录态后退出")
@@ -955,7 +1116,10 @@ def main() -> None:
         return
 
     if args.acc:
-        result = asyncio.run(run_acc(dry_run=args.dry_run, mock=args.mock))
+        result = asyncio.run(run_acc(
+            dry_run=args.dry_run, mock=args.mock,
+            do_collect=not args.flush, do_push=not args.no_push,
+        ))
         logger.info(
             "=== 服配支线完成 | %d 个叶子 | %d 条商品 | %d 条事件 ===",
             result["categories_collected"],
@@ -970,6 +1134,8 @@ def main() -> None:
                 dry_run=args.dry_run,
                 mock=args.mock,
                 scope_prefix=args.scope,
+                do_collect=not args.flush,
+                do_push=not args.no_push,
             )
         )
         logger.info(

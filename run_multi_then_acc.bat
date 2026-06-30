@@ -1,7 +1,20 @@
 @echo off
-REM 定时采集：先跑大盘 --multi，跑完再串行跑服配 --acc。
-REM call 是阻塞的：--acc 必须等 --multi 的 python 进程完全退出后才开始，
-REM 两者不会并发抢同一个 Chrome profile（持久化 profile 独占）。
 cd /d D:\workspace\claude\code\luopan
-call ".venv\Scripts\python.exe" run.py --multi >> "data\cron_multi.log" 2>&1
-call ".venv\Scripts\python.exe" run.py --acc   >> "data\cron_acc.log" 2>&1
+set python=D:\workspace\claude\code\luopan\.venv\Scripts\python.exe
+
+call "%python%" run.py --multi --no-push >> data\cron_multi.log 2>&1
+echo [cron] --multi --no-push exit=%ERRORLEVEL% >> data\cron_multi.log
+
+call "%python%" run.py --acc --no-push >> data\cron_acc.log 2>&1
+echo [cron] --acc --no-push exit=%ERRORLEVEL% >> data\cron_acc.log
+
+rem Wait 15 min before pushing. Use waitfor NOT timeout:
+rem timeout aborts instantly under wscript hidden window (stdin redirected);
+rem waitfor needs no console, times out after 900s (errorlevel 1 is normal).
+waitfor /t 900 LuopanPushDelay > nul 2>&1
+
+call "%python%" run.py --multi --flush >> data\cron_multi.log 2>&1
+echo [cron] --multi --flush exit=%ERRORLEVEL% >> data\cron_multi.log
+
+call "%python%" run.py --acc --flush >> data\cron_acc.log 2>&1
+echo [cron] --acc --flush exit=%ERRORLEVEL% >> data\cron_acc.log

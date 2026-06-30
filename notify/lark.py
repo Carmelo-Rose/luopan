@@ -92,9 +92,11 @@ def _event_to_row(ev: dict, round_label: str, fields: list) -> list:
     return [vm.get(f) for f in fields]
 
 
-def _lark_batch_create(rows: list[list], table_id: str = "", fields: list | None = None) -> bool:
-    """调 lark-cli 批量写一批记录到 Base。成功返回 True。
+def _lark_batch_create(rows: list[list], table_id: str = "", fields: list | None = None) -> list[str] | None:
+    """调 lark-cli 批量写一批记录到 Base。成功返回本批新建的 record_id 列表，失败返回 None。
 
+    返回 record_id 是为了「先写后删」覆盖模式在写入失败时能回滚本轮已写入的记录
+    （见 sync_events_to_base）。成功但响应未带 id 时返回空列表（仍视为成功）。
     fields 默认 _BASE_FIELDS（大盘）；服配传 _ACC_FIELDS。
     """
     tid = table_id or settings.LARK_TABLE_ID
@@ -124,15 +126,16 @@ def _lark_batch_create(rows: list[list], table_id: str = "", fields: list | None
         m = re.search(r"\{.*\}", out, re.S)
         if not m:
             logger.error("飞书 Base 写入无可解析响应: %s", out[:200])
-            return False
+            return None
         data = json.loads(m.group(0))
         if not data.get("ok"):
             logger.error("飞书 Base 写入失败: %s", json.dumps(data.get("error", {}), ensure_ascii=False)[:300])
-            return False
-        return True
+            return None
+        d = data.get("data", {}) or {}
+        return d.get("record_id_list") or []
     except Exception as exc:
         logger.error("飞书 Base 写入异常: %s", exc)
-        return False
+        return None
     finally:
         if tmp and os.path.exists(tmp):
             try:
@@ -230,18 +233,8 @@ def _lark_delete_records(ids: list[str], table_id: str = "") -> int:
                     pass
     return deleted
 
-
-def _clear_base_table(table_id: str = "") -> bool:
-    """清空飞书 Base 整表（覆盖模式写入前调用）。全部删除成功（或本就为空）返回 True。"""
-    ids = _lark_list_all_record_ids(table_id)
-    if not ids:
-        logger.info("飞书 Base 当前无记录，无需清空")
-        return True
-    deleted = _lark_delete_records(ids, table_id)
-    ok = deleted == len(ids)
-    logger.info("飞书 Base 清空: 删除 %d/%d 条%s",
-                deleted, len(ids), "" if ok else "（未全部删除）")
-    return ok
+# 注：旧的 _clear_base_table（先清空再写）已删除——覆盖模式改为「先写后删」原子交换，
+# 见 sync_events_to_base。清旧由那里直接调 _lark_delete_records(old_ids) 完成。
 
 
 def sync_events_to_base(
@@ -281,20 +274,43 @@ def sync_events_to_base(
         for e in events
     ]
 
-    # ── 覆盖模式：写入前清空整表，使 Base 只保留最新一轮 ──────────────
-    # append 模式跳过这步，下面的批量新建即为旧的「叠加追加」行为。
-    if _BASE_WRITE_MODE == "overwrite":
-        if not _clear_base_table(tid):
-            logger.warning("飞书 Base 清空未完全成功，仍继续写入本轮（可能与残留旧数据并存）")
+    # ── 覆盖模式：先写新，全部成功后再删旧（原子交换），避免写入失败把整表清空 ──
+    # 旧实现是「先清空再写」：一旦某批写入失败（如单选 not_found），整表已被清空、
+    # 新数据又没写进去 → 表变空（2026-06-23 大盘事故）。改为：
+    #   1) 先快照现有 record_id；2) 写入本轮新行；3) 仅当全部写成功才删旧快照；
+    #   4) 写入中途失败则回滚本轮已写入的新行、保留旧数据（表至少还是上一轮，不会空）。
+    # append 模式不快照、不删旧，下面的批量新建即旧的「叠加追加」行为。
+    old_ids = _lark_list_all_record_ids(tid) if _BASE_WRITE_MODE == "overwrite" else []
 
     written = 0
+    new_ids: list[str] = []
+    write_failed = False
     for i in range(0, len(rows), _BASE_BATCH):
         batch = rows[i:i + _BASE_BATCH]
-        if not _lark_batch_create(batch, tid, fields=fields):
-            logger.warning("飞书 Base 第 %d 批写入失败，已写入 %d 条后停止", i // _BASE_BATCH + 1, written)
+        ids = _lark_batch_create(batch, tid, fields=fields)
+        if ids is None:
+            logger.warning("飞书 Base 第 %d 批写入失败，已写入 %d 条", i // _BASE_BATCH + 1, written)
+            write_failed = True
             break
+        new_ids.extend(ids)
         written += len(batch)
         logger.info("飞书 Base 同步进度: %d/%d 条", written, len(rows))
+
+    if _BASE_WRITE_MODE == "overwrite":
+        if not write_failed and written == len(rows):
+            # 成功：删除旧快照，完成交换（表只剩本轮）
+            if old_ids:
+                deleted = _lark_delete_records(old_ids, tid)
+                logger.info("飞书 Base 覆盖交换: 删除上一轮 %d/%d 条", deleted, len(old_ids))
+        else:
+            # 失败：回滚本轮已写入的新行，保留旧数据，表不会变空
+            if new_ids:
+                rolled = _lark_delete_records(new_ids, tid)
+                logger.error(
+                    "飞书 Base 写入失败，已回滚本轮新写入 %d/%d 条，保留上一轮 %d 条（表未清空）",
+                    rolled, len(new_ids), len(old_ids),
+                )
+            return 0
 
     logger.info("飞书 Base 同步完成: 写入 %d/%d 条（轮次 %s）", written, len(rows), _round_label(run_id))
     return written

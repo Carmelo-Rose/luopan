@@ -93,6 +93,8 @@ MIN_PRODUCTS: int = _safe_int("MIN_PRODUCTS", int(PAGE_SIZE * TOTAL_PAGES * 0.8)
 # ── 推送 ──────────────────────────────────────────────────────────────
 NOTIFY_CHANNEL: str = os.getenv("NOTIFY_CHANNEL", "wecom") or "none"
 WECOM_WEBHOOK_URL: str = os.getenv("WECOM_WEBHOOK_URL", "")
+# 服配支线（--acc）独立企微群机器人；未配置则回退到大盘的 WECOM_WEBHOOK_URL。
+WECOM_ACC_WEBHOOK_URL: str = os.getenv("WECOM_ACC_WEBHOOK_URL", "") or WECOM_WEBHOOK_URL
 LARK_WEBHOOK_URL: str = os.getenv("LARK_WEBHOOK_URL", "")
 
 # ── 飞书多维表格同步（独立于上面的通知渠道）──────────────────────────

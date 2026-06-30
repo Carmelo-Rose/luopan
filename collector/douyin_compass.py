@@ -449,6 +449,7 @@ class DouyinCompassCollector:
         industry_name: str = "",
         category_name: str = "",
         _reuse_page: bool = False,
+        min_products: int | None = None,
     ) -> list[dict]:
         """
         执行完整采集，返回 200 条商品列表（按 rank 升序）。
@@ -465,6 +466,11 @@ class DouyinCompassCollector:
             二级类目名（写入商品记录）
         _reuse_page : bool
             True = 跳过 goto 导航（多类目采集时复用已有页面）
+        min_products : int | None
+            完整性下限，低于此条数视为残缺采集返回空。None=用 settings.MIN_PRODUCTS（大盘：
+            每个二级类目≈200，160 下限可抓 Cookie 失效的残缺拉取）。服配叶子榜天然可能 <160
+            （如面罩仅 156），须由调用方传低值（如 1），否则会被误判残缺而丢弃。
+            注意：中途页抓取失败（collection_failed）是另一条独立判废逻辑，不受此参数影响。
         """
         captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         # 开采前自愈：若上一类目把共享页面搞死了，这里重启上下文，避免连环失败
@@ -543,10 +549,11 @@ class DouyinCompassCollector:
         # 据商品 leaf_category_id 反查三级类目 + 叶子类目名
         self._enrich_categories(result)
 
-        if collection_failed or len(result) < settings.MIN_PRODUCTS:
+        floor = settings.MIN_PRODUCTS if min_products is None else min_products
+        if collection_failed or len(result) < floor:
             logger.warning(
                 "采集不完整（去重后 %d 条，下限 %d，中途失败=%s），返回空",
-                len(result), settings.MIN_PRODUCTS, collection_failed,
+                len(result), floor, collection_failed,
             )
             return []
 
