@@ -488,7 +488,52 @@ def _create_snapshot_table(run_id: str) -> str | None:
         if ok is None:
             logger.warning("快照表公式列创建失败（数据仍写入）")
 
+    # ⑤ 建表自带的默认 Grid View 配排序：按「事件类型」降序（升150+→升100+→升50+→新进榜），
+    #    不分组、平铺一条条按异动强度往下排，与老大盘表 Grid View 的直觉排序对齐。
+    default_sort = template.get("default_view_sort")
+    if default_sort:
+        _lark_json_cmd(
+            f'+view-set-sort --table-id {tid} --view-id "Grid View"',
+            json_obj={"sort_config": default_sort},
+        )
+
+    # ⑥ 复刻原大盘表(tblUw8qeOtOQfrV3)的两个自定义视图，否则每轮新表只有默认 Grid View。
+    for view_def in template.get("views", []):
+        _create_snapshot_view(tid, view_def)
+
     return tid
+
+
+def _create_snapshot_view(table_id: str, view_def: dict) -> None:
+    """按模板定义在快照表上建一个视图并配置分组/排序。失败只告警，不影响建表主流程。
+
+    view_def 形如 {"name","type","group":[{"field","desc"}],"sort":[{"field","desc"}]}，
+    对齐原大盘表 vew22TJwg0/vew6M6nxtD 的真实配置（+view-get-group/+view-get-sort 读出）。
+    """
+    name = view_def.get("name")
+    vtype = view_def.get("type", "grid")
+    created = _lark_json_cmd(
+        f'+view-create --table-id {table_id}',
+        json_obj={"name": name, "type": vtype},
+    )
+    views = (created or {}).get("data", {}).get("views", [])
+    vid = views[0]["id"] if views else None
+    if not vid:
+        logger.warning("快照表视图创建失败（跳过）: %s", name)
+        return
+
+    group_cfg = view_def.get("group")
+    if group_cfg:
+        _lark_json_cmd(
+            f'+view-set-group --table-id {table_id} --view-id {vid}',
+            json_obj={"group_config": group_cfg},
+        )
+    sort_cfg = view_def.get("sort")
+    if sort_cfg:
+        _lark_json_cmd(
+            f'+view-set-sort --table-id {table_id} --view-id {vid}',
+            json_obj={"sort_config": sort_cfg},
+        )
 
 
 def _rotate_snapshot_tables() -> int:
