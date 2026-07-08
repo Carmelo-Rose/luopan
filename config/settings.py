@@ -67,6 +67,14 @@ TARGET_L1_CATEGORIES: list[str] = [
     if s.strip()
 ] if not TARGET_ALL_L1_CATEGORIES else []
 
+# 目标一级类目下需要跳过的二级类目名称（逗号分隔，按名称精确匹配）。
+# 命中的二级类目不采集、不写快照、不推送，对其他二级类目/一级类目无影响
+# （每个二级类目有独立的 scope_key 和差分基线）。留空则不排除任何类目。
+_EXCLUDE_L2_RAW = os.getenv("EXCLUDE_L2_CATEGORIES", "").strip()
+EXCLUDE_L2_CATEGORIES: list[str] = [
+    s.strip() for s in _EXCLUDE_L2_RAW.split(",") if s.strip()
+]
+
 # 服配叶子类目支线：从 L1 到目标父节点的名称路径（逗号分隔）及叶子类目名。
 # 运行时从 category_raw_dump.json 解析 id，不硬编码。
 _ACC_PATH_RAW = os.getenv("ACC_PATH", "服饰内衣,服装,服装配饰")

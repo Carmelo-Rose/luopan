@@ -31,8 +31,9 @@ $action = New-ScheduledTaskAction `
     -Argument '"D:\workspace\claude\code\luopan\run_hidden.vbs"' `
     -WorkingDirectory 'D:\workspace\claude\code\luopan'
 
+$weekdays = 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'
 $times = @('08:30', '10:30', '13:30', '16:00')
-$triggers = $times | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ }
+$triggers = $times | ForEach-Object { New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At $_ }
 
 Register-ScheduledTask `
     -TaskName 'DouyinCompass_串行采集' `
@@ -40,7 +41,7 @@ Register-ScheduledTask `
     -Trigger $triggers `
     -Settings $settings `
     -Principal $principal `
-    -Description 'Douyin Compass 大盘+服配串行采集 08:30/10:30/13:30/16:00，wscript隐藏窗口，venv Python' `
+    -Description 'Douyin Compass 大盘+服配串行采集 周一至周六 08:30/10:30/13:30/16:00，wscript隐藏窗口，venv Python' `
     -Force
 
 # 午夜单独一个任务：只采集+写飞书 Base，不推企微（run_multi_then_acc_midnight.bat
@@ -51,7 +52,7 @@ $midnightAction = New-ScheduledTaskAction `
     -Argument '"D:\workspace\claude\code\luopan\run_hidden_midnight.vbs"' `
     -WorkingDirectory 'D:\workspace\claude\code\luopan'
 
-$midnightTrigger = New-ScheduledTaskTrigger -Daily -At '00:00'
+$midnightTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At '00:00'
 
 Register-ScheduledTask `
     -TaskName 'DouyinCompass_串行采集_午夜' `
@@ -59,10 +60,10 @@ Register-ScheduledTask `
     -Trigger $midnightTrigger `
     -Settings $settings `
     -Principal $principal `
-    -Description 'Douyin Compass 大盘+服配串行采集 00:00，只采集写飞书 Base，不推企微' `
+    -Description 'Douyin Compass 大盘+服配串行采集 周一至周六 00:00，只采集写飞书 Base，不推企微' `
     -Force
 
-Write-Host '计划任务注册成功！白天 4 个触发时间：08:30 / 10:30 / 13:30 / 16:00（采集+推企微）' -ForegroundColor Green
-Write-Host '午夜任务：00:00（只采集写飞书 Base，不推企微）' -ForegroundColor Green
+Write-Host '计划任务注册成功！周一至周六 4 个触发时间：08:30 / 10:30 / 13:30 / 16:00（采集+推企微）' -ForegroundColor Green
+Write-Host '午夜任务：周一至周六 00:00（只采集写飞书 Base，不推企微）' -ForegroundColor Green
 Write-Host '按任意键关闭…'
 $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')

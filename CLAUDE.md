@@ -87,6 +87,7 @@ Key V2 settings:
 - `RANK_API_PATH=video_bring_good`
 - `RANK_TAB_TEXT=短视频榜`
 - `TARGET_L1_CATEGORIES` for `--multi`
+- `EXCLUDE_L2_CATEGORIES` skips named L2 categories under the target L1s (comma-separated, exact match). Filtered in `main.py:_resolve_categories()`'s flatten step, so cached/discovered category trees are untouched — only the collection list is trimmed. Each L2 has its own scope-isolated run history, so excluding one never affects others.
 - `ACC_PATH` and `ACC_LEAF_NAMES` for `--acc`
 - `LARK_TABLE_ID` for the main table
 - `LARK_ACC_TABLE_ID` for the accessories table

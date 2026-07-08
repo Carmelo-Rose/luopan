@@ -137,6 +137,16 @@ def _range_str(obj: Optional[dict]) -> str:
             return "~".join(pcts)
         except Exception:
             return "~".join(vals)
+    if unit == "price":
+        # 金额字段（如 pay_amt）以分为单位，需 /100 转成元，否则比罗盘页面显示大 100 倍
+        try:
+            yuan = []
+            for v in vals:
+                f = float(v) / 100
+                yuan.append(str(int(f)) if f == int(f) else f"{f:.2f}".rstrip("0").rstrip("."))
+            return "~".join(yuan)
+        except Exception:
+            return "~".join(vals)
     return "~".join(vals)
 
 

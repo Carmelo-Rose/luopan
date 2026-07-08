@@ -380,17 +380,23 @@ async def _expand_target_columns(page: Page, target_l1_names: list[str]) -> None
 _CATEGORY_CACHE_TTL_SECONDS = 7 * 24 * 3600
 
 
-def load_category_tree(cache_path: str, ttl: int = _CATEGORY_CACHE_TTL_SECONDS) -> Optional[dict]:
+def load_category_tree(
+    cache_path: str,
+    ttl: int = _CATEGORY_CACHE_TTL_SECONDS,
+    allow_expired: bool = False,
+) -> Optional[dict]:
     """从缓存文件加载类目树，超过 TTL 则视为过期。"""
     if not os.path.exists(cache_path):
         return None
     try:
         age = time.time() - os.path.getmtime(cache_path)
-        if age > ttl:
+        if age > ttl and not allow_expired:
             logger.info("类目树缓存已过期（%.1f 天），将重新发现", age / 86400)
             return None
         with open(cache_path, "r", encoding="utf-8") as f:
             tree = json.load(f)
+        if age > ttl:
+            logger.warning("类目树缓存已过期（%.1f 天），但将继续使用旧缓存", age / 86400)
         logger.info("从缓存加载类目树: %s (%d 个 L1, 共 %d 个 L2)",
                      cache_path, len(tree),
                      sum(len(v) for v in tree.values()))

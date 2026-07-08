@@ -29,7 +29,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from config import settings
 from db import database
@@ -43,6 +43,13 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("main")
+
+_BUSINESS_TZ = timezone(timedelta(hours=8))
+
+
+def _business_now() -> datetime:
+    """Return the business timestamp used in reports and push summaries."""
+    return datetime.now(_BUSINESS_TZ)
 
 
 # ── Mock 数据 ──────────────────────────────────────────────────────────
@@ -211,7 +218,7 @@ async def run_multi(
     dict  {"run_id", "categories_collected", "total_products", "all_events", "excel_path"}
     """
     run_id = datetime.now(timezone.utc).isoformat()
-    ts = datetime.now()
+    ts = _business_now()
     logger.info("═══ 多类目模式 run_id: %s ═══", run_id)
     logger.info(
         "目标一级类目: %s",
@@ -510,6 +517,9 @@ async def _resolve_categories() -> list[dict]:
 
     cache_path = settings.CATEGORY_TREE_CACHE
     tree = load_category_tree(cache_path)
+    stale_tree = None
+    if not tree:
+        stale_tree = load_category_tree(cache_path, allow_expired=True)
 
     # 检测缺失的 L1（配置了但缓存中没有）
     target_l1 = set(settings.TARGET_L1_CATEGORIES)
@@ -535,8 +545,12 @@ async def _resolve_categories() -> list[dict]:
         if tree:
             save_category_tree(cache_path, tree)
         else:
-            logger.warning("自动发现未找到任何目标类目")
-            return []
+            if stale_tree:
+                logger.warning("自动发现未找到任何目标类目，回退使用过期类目缓存")
+                tree = stale_tree
+            else:
+                logger.warning("自动发现未找到任何目标类目")
+                return []
 
     elif missing_l1:
         logger.info("类目树缓存缺少 %d 个一级类目: %s，补充发现...", len(missing_l1), list(missing_l1))
@@ -555,20 +569,27 @@ async def _resolve_categories() -> list[dict]:
             save_category_tree(cache_path, tree)
             logger.info("补充发现 %d 个一级类目: %s", len(new_tree), list(new_tree.keys()))
         else:
-            logger.warning("补充发现未找到任何缺失类目")
+            logger.warning("补充发现未找到任何缺失类目，继续使用现有类目缓存")
 
-    # 展平为列表
+    # 展平为列表；跳过 EXCLUDE_L2_CATEGORIES 命中的二级类目（不采集、不推送）
+    exclude_l2 = set(settings.EXCLUDE_L2_CATEGORIES)
     flat = []
+    skipped = []
     for l1_name, l2_list in tree.items():
         if not discover_all and l1_name not in target_l1:
             continue
         for l2 in l2_list:
+            if l2["name"] in exclude_l2:
+                skipped.append(f"{l1_name}>{l2['name']}")
+                continue
             flat.append({
                 "industry_name": l1_name,
                 "category_name": l2["name"],
                 "industry_id": l2.get("industry_id", ""),
                 "category_id": l2.get("category_id", l2.get("id", "")),
             })
+    if skipped:
+        logger.info("按 EXCLUDE_L2_CATEGORIES 跳过 %d 个二级类目: %s", len(skipped), skipped)
     return flat
 
 
@@ -871,7 +892,7 @@ async def run_acc(
     整榜后本地过滤（旧法 TOP200 内常 0 命中配饰叶子）。
     """
     run_id = datetime.now(timezone.utc).isoformat()
-    ts = datetime.now()
+    ts = _business_now()
     scope_prefix = "video_acc"
     logger.info("═══ 服配支线 run_id: %s ═══", run_id)
 

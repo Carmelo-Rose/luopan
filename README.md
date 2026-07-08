@@ -53,6 +53,7 @@ python run.py --acc --dry-run
 | `RANK_API_PATH` | 默认 `video_bring_good` |
 | `RANK_TAB_TEXT` | 默认 `短视频榜` |
 | `TARGET_L1_CATEGORIES` | `--multi` 采集的一级类目列表，`*` 表示账号可见全部 |
+| `EXCLUDE_L2_CATEGORIES` | 跳过采集/推送的二级类目名单（逗号分隔），留空不排除 |
 | `ACC_PATH` | 服配路径，默认 `服饰内衣,服装,服装配饰` |
 | `ACC_LEAF_NAMES` | 服配目标叶子，默认 5 个 |
 | `LARK_BASE_APP_TOKEN` / `LARK_TABLE_ID` | 大盘飞书表 |
