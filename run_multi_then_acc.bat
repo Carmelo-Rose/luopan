@@ -1,6 +1,6 @@
 @echo off
-cd /d D:\workspace\claude\code\luopan
-set python=D:\workspace\claude\code\luopan\.venv\Scripts\python.exe
+cd /d %~dp0
+set python=%~dp0.venv\Scripts\python.exe
 
 call "%python%" run.py --multi --no-push >> data\cron_multi.log 2>&1
 echo [cron] --multi --no-push exit=%ERRORLEVEL% >> data\cron_multi.log

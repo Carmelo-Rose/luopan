@@ -28,8 +28,8 @@ $principal = New-ScheduledTaskPrincipal `
 # 白天 4 个触发：采集 + 飞书 Base 写入 + 企微推送（原有 run_multi_then_acc.bat 不变）
 $action = New-ScheduledTaskAction `
     -Execute 'wscript.exe' `
-    -Argument '"D:\workspace\claude\code\luopan\run_hidden.vbs"' `
-    -WorkingDirectory 'D:\workspace\claude\code\luopan'
+    -Argument "`"$PSScriptRoot\run_hidden.vbs`"" `
+    -WorkingDirectory $PSScriptRoot
 
 $weekdays = 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'
 $times = @('08:30', '10:30', '13:30', '16:00')
@@ -49,8 +49,8 @@ Register-ScheduledTask `
 # （08:30）的 --flush 一并补发，复用 main.py 既有的补发逻辑，不丢事件。
 $midnightAction = New-ScheduledTaskAction `
     -Execute 'wscript.exe' `
-    -Argument '"D:\workspace\claude\code\luopan\run_hidden_midnight.vbs"' `
-    -WorkingDirectory 'D:\workspace\claude\code\luopan'
+    -Argument "`"$PSScriptRoot\run_hidden_midnight.vbs`"" `
+    -WorkingDirectory $PSScriptRoot
 
 $midnightTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $weekdays -At '00:00'
 

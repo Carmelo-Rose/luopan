@@ -1,6 +1,6 @@
 @echo off
-cd /d D:\workspace\claude\code\luopan
-set python=D:\workspace\claude\code\luopan\.venv\Scripts\python.exe
+cd /d %~dp0
+set python=%~dp0.venv\Scripts\python.exe
 
 rem Midnight run: collect + write to Feishu Base only, skip WeCom push.
 rem Pending events stay notified=0 and get flushed together with the next
