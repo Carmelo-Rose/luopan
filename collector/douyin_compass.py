@@ -158,6 +158,10 @@ def _parse_card(
     info = card.get("product_info", {})
     product_id = str(info.get("id", ""))
     product_title = info.get("name", "")
+    shop_info = (
+        info.get("shop_name") or info.get("shop_info") or info.get("seller_name")
+        or card.get("shop_name") or card.get("shop_info") or ""
+    )
     # 商品自带的叶子（最细）类目 id；翻译成三级/叶子类目名在 collect() 末尾统一处理。
     _leaf_cid = info.get("leaf_category_id")
     leaf_category_id = str(_leaf_cid) if _leaf_cid not in (None, "") else ""
@@ -180,6 +184,7 @@ def _parse_card(
         "rank": rank,
         "product_id": product_id,
         "product_title": product_title,
+        "shop_info": shop_info,
         "product_url": product_url,
         "image": image,
         "price_range": price_range,
@@ -325,6 +330,7 @@ async def _parse_dom_rows(
             "rank": rank,
             "product_id": product_id,
             "product_title": product_title,
+            "shop_info": shop_info,
             "product_url": url,
             "image": "",
             "price_range": "",

@@ -29,6 +29,7 @@ _COLUMN_MIGRATIONS = [
     ("products_snapshot", "category_l3_name"),
     ("products_snapshot", "leaf_category_name"),
     ("products_snapshot", "image"),
+    ("products_snapshot", "shop_info"),
     ("ranking_event", "industry_name"),
     ("ranking_event", "category_name"),
     ("ranking_event", "category_l3_name"),
@@ -36,6 +37,7 @@ _COLUMN_MIGRATIONS = [
     ("ranking_event", "image"),
     ("ranking_event", "pay_amount"),
     ("ranking_event", "price"),
+    ("ranking_event", "shop_info"),
 ]
 
 
@@ -61,19 +63,19 @@ def insert_snapshot(conn: sqlite3.Connection, run_id: str, rows: list[dict]) -> 
     sql = """
         INSERT OR IGNORE INTO products_snapshot
             (run_id, scope_key, rank, product_id, product_title, product_url,
-             image, price_range, pay_amount, clicks, conversion_rate,
+             image, shop_info, price_range, pay_amount, clicks, conversion_rate,
              card_order_count, captured_at, industry_name, category_name,
              category_l3_name, leaf_category_name)
         VALUES
             (:run_id, :scope_key, :rank, :product_id, :product_title, :product_url,
-             :image, :price_range, :pay_amount, :clicks, :conversion_rate,
+             :image, :shop_info, :price_range, :pay_amount, :clicks, :conversion_rate,
              :card_order_count, :captured_at,
              COALESCE(:industry_name, ''), COALESCE(:category_name, ''),
              COALESCE(:category_l3_name, ''), COALESCE(:leaf_category_name, ''))
     """
     # 防御性默认：旧调用方/测试可能不带新字段，统一补空避免绑定缺参
     data = [
-        {"category_l3_name": "", "leaf_category_name": "", "image": "", **r, "run_id": run_id}
+        {"category_l3_name": "", "leaf_category_name": "", "image": "", "shop_info": "", **r, "run_id": run_id}
         for r in rows
     ]
     conn.executemany(sql, data)
@@ -178,12 +180,12 @@ def insert_events(conn: sqlite3.Connection, events: list[dict]) -> int:
     sql = """
         INSERT OR IGNORE INTO ranking_event
             (run_id, scope_key, event_type, product_id, product_title, product_url,
-             rank_current, rank_previous, rank_delta, image, pay_amount, price,
+             rank_current, rank_previous, rank_delta, image, shop_info, pay_amount, price,
              created_at, notified,
              industry_name, category_name, category_l3_name, leaf_category_name)
         VALUES
             (:run_id, :scope_key, :event_type, :product_id, :product_title, :product_url,
-             :rank_current, :rank_previous, :rank_delta, :image, :pay_amount, :price,
+             :rank_current, :rank_previous, :rank_delta, :image, :shop_info, :pay_amount, :price,
              :created_at, 0,
              COALESCE(:industry_name, ''), COALESCE(:category_name, ''),
              COALESCE(:category_l3_name, ''), COALESCE(:leaf_category_name, ''))
@@ -191,7 +193,7 @@ def insert_events(conn: sqlite3.Connection, events: list[dict]) -> int:
     # 防御性默认：旧调用方/测试可能不带新字段，统一补空避免绑定缺参
     data = [
         {"category_l3_name": "", "leaf_category_name": "",
-         "image": "", "pay_amount": "", "price": "", **e}
+         "image": "", "shop_info": "", "pay_amount": "", "price": "", **e}
         for e in events
     ]
     before = conn.total_changes

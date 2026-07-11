@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS products_snapshot (
     rank             INTEGER NOT NULL,
     product_id       TEXT    NOT NULL,
     product_title    TEXT,
+    shop_info        TEXT    DEFAULT '',
     product_url      TEXT,
     image            TEXT    DEFAULT '',         -- 商品主图 URL（接口 product_info.image_url）
     price_range      TEXT,
@@ -33,6 +34,7 @@ CREATE TABLE IF NOT EXISTS ranking_event (
     event_type     TEXT    NOT NULL,            -- NEW_ENTRY / RANK_UP_50 / RANK_UP_100 / RANK_UP_150
     product_id     TEXT    NOT NULL,
     product_title  TEXT,
+    shop_info      TEXT    DEFAULT '',
     product_url    TEXT,
     rank_current   INTEGER,
     rank_previous  INTEGER,

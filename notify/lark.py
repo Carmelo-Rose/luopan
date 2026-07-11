@@ -38,7 +38,7 @@ _BASE_FIELDS = [
 # 注意：写入字段必须是目标表里真实存在的列，否则整表会被清空（见 HANDOFF §4.2 同类坑），
 # 改这里前先确认 tbllW7yLiCQu606X 的列已同步删掉一级/二级/三级类目。
 _ACC_FIELDS = [
-    "商品标题", "采集轮次", "叶子类目",
+    "商品标题", "店铺信息", "采集轮次", "叶子类目",
     "当前排名", "上轮排名", "升幅", "事件类型", "支付金额", "价格", "商品图",
 ]
 
@@ -71,6 +71,7 @@ def _event_value_map(ev: dict, round_label: str) -> dict:
     """
     return {
         "商品标题": ev.get("product_title", "") or "",
+        "店铺信息": ev.get("shop_info", "") or "",
         "采集轮次": round_label,
         "一级类目": ev.get("industry_name", "") or "",
         "二级类目": ev.get("category_name", "") or "",

@@ -139,6 +139,7 @@ def _make_event(
         "product_title": row.get("product_title", ""),
         "product_url": row.get("product_url", ""),
         "image": row.get("image", ""),
+        "shop_info": row.get("shop_info", ""),
         # pay_amount 取自快照；price 由 main 在拓价后回填（默认回退脱敏价格带）
         "pay_amount": row.get("pay_amount", ""),
         "price": row.get("price_range", ""),
