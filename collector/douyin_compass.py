@@ -158,10 +158,23 @@ def _parse_card(
     info = card.get("product_info", {})
     product_id = str(info.get("id", ""))
     product_title = info.get("name", "")
-    shop_info = (
-        info.get("shop_name") or info.get("shop_info") or info.get("seller_name")
-        or card.get("shop_name") or card.get("shop_info") or ""
-    )
+    # 短视频榜 API 将店铺放在 product_info.shop_list[*].shop_name，
+    # 不是 product_info.shop_name；保留旧字段作为兼容回退。
+    shop_list = info.get("shop_list") or card.get("shop_list") or []
+    shop_info = ""
+    if isinstance(shop_list, list):
+        names = []
+        for shop in shop_list:
+            if isinstance(shop, dict):
+                name = str(shop.get("shop_name") or shop.get("name") or "").strip()
+                if name and name not in names:
+                    names.append(name)
+        shop_info = "、".join(names)
+    if not shop_info:
+        shop_info = (
+            info.get("shop_name") or info.get("shop_info") or info.get("seller_name")
+            or card.get("shop_name") or card.get("shop_info") or ""
+        )
     # 商品自带的叶子（最细）类目 id；翻译成三级/叶子类目名在 collect() 末尾统一处理。
     _leaf_cid = info.get("leaf_category_id")
     leaf_category_id = str(_leaf_cid) if _leaf_cid not in (None, "") else ""
