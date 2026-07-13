@@ -434,12 +434,14 @@ async def run_multi(
         # ── 飞书 Base 同步：采集即写（与企微推送时序解耦）────────────────────
         # 让在线表在「采集完—延后推送」的等待窗口内就是最新数据，而非等到 flush 才更新。
         # overwrite 模式幂等：flush 里仍保留同步作为兜底，同一批事件重写结果一致。
+        # 只同步本轮 run_id 的事件——Base 是「覆盖快照」语义，只保留最新一轮；
+        # 「最近两轮」补发窗口只用于企微推送补发，不能用在这里，否则午夜 --no-push
+        # 遗留的 notified=0 事件会在下一轮和新事件混写进同一批，导致 Base 表里
+        # 同时出现两个采集轮次的行（2026-07-13 大盘/服配表叠加事故）。
         if not dry_run:
-            # 按 video_order 前缀隔离，避免把交错运行的服配(video_acc)事件卷进大盘飞书表
-            recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
             to_sync = [
                 e for e in database.get_pending_events(conn)
-                if e.get("run_id") in recent_runs
+                if e.get("run_id") == run_id
                 and (e.get("scope_key") or "").startswith(scope_prefix)
             ]
             if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
@@ -1048,11 +1050,14 @@ async def run_acc(
 
         # ── 服配飞书 Base 同步：采集即写（与企微推送时序解耦，等待窗口内表即最新）──
         # overwrite 模式幂等：flush 里仍保留同步作为兜底，同一批事件重写结果一致。
+        # 只同步本轮 run_id 的事件——Base 是「覆盖快照」语义，只保留最新一轮；
+        # 「最近两轮」补发窗口只用于下面的企微推送（_finalize_acc_push），不能用在这里，
+        # 否则午夜 --no-push 遗留的 notified=0 事件会在下一轮和新事件混写进同一批，
+        # 导致 Base 表里同时出现两个采集轮次的行（2026-07-12 服配表叠加事故）。
         if not dry_run:
-            recent_runs = set(database.get_latest_run_ids_for_prefix(conn, scope_prefix, 2))
             to_sync = [
                 e for e in database.get_pending_events(conn)
-                if e.get("run_id") in recent_runs
+                if e.get("run_id") == run_id
                 and (e.get("scope_key") or "").startswith(scope_prefix)
             ]
             if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
