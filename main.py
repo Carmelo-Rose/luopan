@@ -1053,7 +1053,7 @@ async def run_acc(
         # 只同步本轮 run_id 的事件——Base 是「覆盖快照」语义，只保留最新一轮；
         # 「最近两轮」补发窗口只用于下面的企微推送（_finalize_acc_push），不能用在这里，
         # 否则午夜 --no-push 遗留的 notified=0 事件会在下一轮和新事件混写进同一批，
-        # 导致 Base 表里同时出现两个采集轮次的行（2026-07-12 服配表叠加事故）。
+        # 导致 Base 表里同时出现两个采集轮次的行（2026-07-13 服配表叠加事故）。
         if not dry_run:
             to_sync = [
                 e for e in database.get_pending_events(conn)
