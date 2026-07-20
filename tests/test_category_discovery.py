@@ -145,5 +145,6 @@ def test_resolve_leaf_targets_uses_l2_category_id_and_leaf_id_separately():
             "industry_id": "4",
             "category_id": "1000003282",
             "leaf_category_id": "1000003461",
+            "rank_category_id": "1000003282,1000003289,1000003461",
         }
     ]

@@ -129,6 +129,26 @@ def _api_error(payload: dict) -> tuple[str, str] | None:
     return None
 
 
+def _norm_label(text: str) -> str:
+    """Normalize cascader labels for exact matching across whitespace variants."""
+    return re.sub(r"\s+", "", text or "").strip()
+
+
+def _rank_url_matches_category(url: str, industry_id: str, category_id: str) -> bool:
+    """Return True when a rank XHR URL belongs to the requested category path."""
+    try:
+        qs = parse_qs(urlparse(url).query)
+    except Exception:
+        return False
+    got_industry = (qs.get("industry_id") or [""])[0]
+    got_category = (qs.get("category_id") or [""])[0]
+    if industry_id and got_industry != industry_id:
+        return False
+    if category_id and got_category != category_id:
+        return False
+    return True
+
+
 # ── 字段解析 ──────────────────────────────────────────────────────────
 
 def _range_str(obj: Optional[dict]) -> str:
@@ -742,9 +762,12 @@ class DouyinCompassCollector:
                     logger.warning("类目级联第 %d 列未出现，已选路径=%s", idx + 1, labels[:idx])
                     return False
 
-                item = menus.nth(idx).locator(".aurora-cascader-menu-item", has_text=label).first
-                await item.scroll_into_view_if_needed(timeout=5000)
-                await item.click(timeout=5000)
+                if not await self._click_cascader_item(menus.nth(idx), label):
+                    logger.warning(
+                        "类目级联第 %d 列未找到选项「%s」，已选路径=%s",
+                        idx + 1, label, labels[:idx],
+                    )
+                    return False
                 await page.wait_for_timeout(800)
 
             logger.info("已通过页面级联选择类目: %s", " > ".join(labels))
@@ -753,16 +776,53 @@ class DouyinCompassCollector:
             logger.warning("页面级联选择类目失败（%s）: %s", " > ".join(labels), exc)
             return False
 
+    async def _click_cascader_item(self, menu, label: str) -> bool:
+        """Click one cascader option by exact normalized text, scrolling the menu if needed."""
+        target = _norm_label(label)
+        if not target:
+            return False
+
+        for _ in range(30):
+            clicked = await menu.evaluate(
+                """(root, target) => {
+                    const norm = (s) => (s || '').replace(/\\s+/g, '').trim();
+                    const items = Array.from(root.querySelectorAll('.aurora-cascader-menu-item'));
+                    const item = items.find((el) => norm(el.textContent) === target);
+                    if (item) {
+                        item.scrollIntoView({block: 'center'});
+                        item.click();
+                        return true;
+                    }
+                    root.scrollTop += Math.max(80, Math.floor(root.clientHeight * 0.8));
+                    return false;
+                }""",
+                target,
+            )
+            if clicked:
+                return True
+            await asyncio.sleep(0.2)
+
+        texts = await menu.locator(".aurora-cascader-menu-item").all_text_contents()
+        logger.debug("类目级联选项未命中「%s」，当前列可见/已渲染选项=%s", label, texts[:30])
+        return False
+
     async def _wait_for_rank_response(
         self,
         page: Page,
         timeout_ms: int = 15000,
+        industry_id: str = "",
+        category_id: str = "",
     ) -> tuple[list[dict], str] | None:
         """Listen for the latest successful rank API response emitted by the page itself."""
         hits: list[tuple[list[dict], str]] = []
 
         async def on_response(resp: Response):
             if not (_is_rank_api(resp.url) and resp.status == 200):
+                return
+            if (industry_id or category_id) and not _rank_url_matches_category(
+                resp.url, industry_id, category_id,
+            ):
+                logger.debug("跳过非目标类目 API: %s", resp.url)
                 return
             try:
                 payload = await resp.json()
@@ -820,32 +880,24 @@ class DouyinCompassCollector:
             )
 
         labels = self._category_selection_labels(industry_name, category_name, cat_id)
-        hits: list[tuple[list[dict], str]] = []
-
-        async def on_response(resp: Response):
-            if not (_is_rank_api(resp.url) and resp.status == 200):
-                return
-            try:
-                payload = await resp.json()
-            except Exception:
-                return
-            err = _api_error(payload)
-            if err:
-                logger.error("页面原生 API 业务错误: %s, msg=%s", err[0], err[1])
-                return
-            card_list = _extract_cards(payload)
-            if card_list:
-                hits.append((card_list, resp.url))
-
-        page.on("response", on_response)
-        selected = await self._select_category_via_cascader(page, labels)
+        waiter = asyncio.create_task(
+            self._wait_for_rank_response(
+                page,
+                timeout_ms=20000,
+                industry_id=ind_id,
+                category_id=cat_id,
+            )
+        )
         try:
-            await page.wait_for_timeout(4000)
-            hit = hits[-1] if hits else None
-        finally:
-            page.remove_listener("response", on_response)
+            selected = await self._select_category_via_cascader(page, labels)
+            hit = await waiter if selected else None
+        except Exception:
+            waiter.cancel()
+            raise
 
         if not selected or not hit:
+            if not waiter.done():
+                waiter.cancel()
             return [], ""
 
         card_list, captured_url = hit

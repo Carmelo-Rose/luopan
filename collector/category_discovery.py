@@ -15,6 +15,7 @@
   L2.value = category_id (如 "1000003462" = 五金/工具)
 """
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -232,7 +233,15 @@ async def discover_categories(page: Page, target_l1_names: list[str]) -> dict:
           ...
         }
     """
-    logger.info("开始类目树自动发现（React fiber），目标 L1: %s", target_l1_names or "（账号可见的全部）")
+    logger.info("开始类目树自动发现（Aurora/React fiber），目标 L1: %s", target_l1_names or "（账号可见的全部）")
+
+    aurora_tree = await _discover_categories_aurora(page, target_l1_names)
+    if aurora_tree:
+        logger.info(
+            "Aurora 类目树发现完成: %d 个 L1, 共 %d 个二级类目",
+            len(aurora_tree), sum(len(v) for v in aurora_tree.values()),
+        )
+        return aurora_tree
 
     # 确保级联选择器已展开（触发组件渲染）
     await _ensure_cascader_rendered(page)
@@ -311,6 +320,131 @@ async def discover_categories(page: Page, target_l1_names: list[str]) -> dict:
                 "可能是该账号无此类目权限、或类目名与平台不一致，已跳过（非致命）",
                 missing,
             )
+    return tree
+
+
+def _known_category_ids() -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+    """Build name->id maps from the latest cached tree, used by DOM-based discovery."""
+    l1_ids: dict[str, str] = {}
+    l2_ids: dict[tuple[str, str], str] = {}
+    cached = load_category_tree(settings.CATEGORY_TREE_CACHE, allow_expired=True) or {}
+    for l1_name, l2_list in cached.items():
+        for l2 in l2_list:
+            industry_id = str(l2.get("industry_id", ""))
+            category_id = str(l2.get("category_id", l2.get("id", "")))
+            if industry_id:
+                l1_ids.setdefault(l1_name, industry_id)
+            if category_id:
+                l2_ids[(l1_name, l2.get("name", ""))] = category_id
+    return l1_ids, l2_ids
+
+
+async def _click_aurora_item(menu, label: str) -> bool:
+    """Click an Aurora cascader item by exact normalized text."""
+    target = "".join((label or "").split())
+    if not target:
+        return False
+    for _ in range(30):
+        clicked = await menu.evaluate(
+            """(root, target) => {
+                const norm = (s) => (s || '').replace(/\\s+/g, '').trim();
+                const items = Array.from(root.querySelectorAll('.aurora-cascader-menu-item'));
+                const item = items.find((el) => norm(el.textContent) === target);
+                if (item) {
+                    item.scrollIntoView({block: 'center'});
+                    item.click();
+                    return true;
+                }
+                root.scrollTop += Math.max(80, Math.floor(root.clientHeight * 0.8));
+                return false;
+            }""",
+            target,
+        )
+        if clicked:
+            return True
+        await asyncio.sleep(0.2)
+    return False
+
+
+async def _discover_categories_aurora(page: Page, target_l1_names: list[str]) -> dict:
+    """
+    Discover currently selectable L1/L2 categories from the Aurora cascader DOM.
+
+    The current Compass UI no longer exposes the old .ecom-cascader React fiber in
+    some accounts. Aurora DOM exposes visible labels but not stable ids, so ids are
+    joined from the previous cache. Unknown new L2 labels are logged and skipped
+    until a raw id source is added.
+    """
+    try:
+        locator_result = page.locator(".aurora-cascader")
+        if inspect.isawaitable(locator_result):
+            close = getattr(locator_result, "close", None)
+            if close:
+                close()
+            return {}
+        cascader = locator_result.locator("visible=true").first
+        if await cascader.count() == 0:
+            return {}
+        await cascader.click(timeout=5000)
+        await page.wait_for_selector(".aurora-cascader-menus", timeout=10000)
+    except Exception as exc:
+        logger.debug("Aurora 级联选择器不可用，回退 React fiber: %s", exc)
+        return {}
+
+    l1_ids, l2_ids = _known_category_ids()
+    target_set = set(target_l1_names or [])
+    discover_all = not target_set
+    tree: dict[str, list[dict]] = {}
+
+    menus = page.locator(".aurora-cascader-menu")
+    first_menu = menus.nth(0)
+    l1_names = [
+        t.strip() for t in await first_menu.locator(".aurora-cascader-menu-item").all_text_contents()
+        if t.strip()
+    ]
+    for l1_name in l1_names:
+        if not discover_all and l1_name not in target_set:
+            continue
+        if not await _click_aurora_item(first_menu, l1_name):
+            logger.warning("Aurora 类目发现：未能点击 L1「%s」", l1_name)
+            continue
+        await page.wait_for_timeout(800)
+        if await menus.count() < 2:
+            logger.warning("Aurora 类目发现：L1「%s」无二级菜单", l1_name)
+            continue
+
+        second_menu = menus.nth(1)
+        l2_names = [
+            t.strip() for t in await second_menu.locator(".aurora-cascader-menu-item").all_text_contents()
+            if t.strip() and t.strip() != _ALL_NODE_LABEL
+        ]
+        l2_list: list[dict] = []
+        for l2_name in l2_names:
+            industry_id = l1_ids.get(l1_name, "")
+            category_id = l2_ids.get((l1_name, l2_name), "")
+            if not industry_id or not category_id:
+                logger.warning(
+                    "Aurora 类目发现：%s > %s 缺少缓存 id，暂跳过",
+                    l1_name, l2_name,
+                )
+                continue
+            l2_list.append({
+                "name": l2_name,
+                "category_id": category_id,
+                "industry_id": industry_id,
+            })
+        if l2_list:
+            tree[l1_name] = l2_list
+            logger.info(
+                "  [%s] (industry_id=%s): %d 个当前可选二级类目: %s",
+                l1_name, l1_ids.get(l1_name, ""), len(l2_list),
+                [c["name"] for c in l2_list],
+            )
+
+    if target_set:
+        missing = sorted(target_set - set(tree))
+        if missing:
+            logger.warning("Aurora 类目发现：目标 L1 当前不可见或无可用 L2: %s", missing)
     return tree
 
 
