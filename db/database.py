@@ -4,6 +4,7 @@ SQLite 数据访问层。
 """
 import sqlite3
 import os
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -243,3 +244,75 @@ def mark_events_notified(conn: sqlite3.Connection, event_ids: list[int]) -> None
         event_ids,
     )
     conn.commit()
+
+
+# ── 详情页富化（属性 / 详情图 / 主图集）───────────────────────────────
+
+def upsert_enrichment(
+    conn: sqlite3.Connection,
+    product_id: str,
+    attrs: dict | None = None,
+    detail_images: list | None = None,
+    main_images: list | None = None,
+    source_url: str = "",
+    updated_at: str = "",
+) -> None:
+    """写入/合并一个商品的详情页富化结果（product_id 为主键）。
+
+    attrs/detail_images/main_images 统一以 JSON 文本落库；传 None/空 表示本次没
+    抓到该项——**逐列合并，不整行覆盖**：某一列这次没抓到就保留上次落库的旧值，
+    不会因为"这次只抓到属性、没抓到详情图"就把上次成功抓到的详情图冲掉（反之
+    亦然）。首次插入（无旧值可保留）时空列落 ''，与建表默认一致，查询侧按空处理。
+    updated_at 由调用方传 ISO 时间串（本层不取系统时间，保持可测/可复现）。
+    """
+    attrs_json = json.dumps(attrs, ensure_ascii=False) if attrs else ""
+    detail_json = json.dumps(detail_images, ensure_ascii=False) if detail_images else ""
+    main_json = json.dumps(main_images, ensure_ascii=False) if main_images else ""
+    conn.execute(
+        """
+        INSERT INTO product_enrichment
+            (product_id, attrs_json, detail_images_json, main_images_json,
+             source_url, updated_at)
+        VALUES (:pid, :attrs, :detail, :main, :src, :ts)
+        ON CONFLICT(product_id) DO UPDATE SET
+            attrs_json         = CASE WHEN excluded.attrs_json != '' THEN excluded.attrs_json ELSE product_enrichment.attrs_json END,
+            detail_images_json = CASE WHEN excluded.detail_images_json != '' THEN excluded.detail_images_json ELSE product_enrichment.detail_images_json END,
+            main_images_json   = CASE WHEN excluded.main_images_json != '' THEN excluded.main_images_json ELSE product_enrichment.main_images_json END,
+            source_url         = excluded.source_url,
+            updated_at         = excluded.updated_at
+        """,
+        {"pid": product_id, "attrs": attrs_json, "detail": detail_json,
+         "main": main_json, "src": source_url, "ts": updated_at},
+    )
+    conn.commit()
+
+
+def get_enrichment(conn: sqlite3.Connection, product_id: str) -> Optional[dict]:
+    """按 product_id 取富化结果，解析 JSON 后返回；无记录返回 None。
+
+    返回 {"product_id","attributes"(dict),"detail_images"(list),
+    "main_images"(list),"source_url","updated_at"}。JSON 解析失败的字段退回空容器，
+    不抛异常——富化数据脏不该拖垮查询。"""
+    row = conn.execute(
+        "SELECT * FROM product_enrichment WHERE product_id = ?",
+        (product_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    def _loads(s, default):
+        if not s:
+            return default
+        try:
+            return json.loads(s)
+        except Exception:
+            return default
+
+    return {
+        "product_id": row["product_id"],
+        "attributes": _loads(row["attrs_json"], {}),
+        "detail_images": _loads(row["detail_images_json"], []),
+        "main_images": _loads(row["main_images_json"], []),
+        "source_url": row["source_url"],
+        "updated_at": row["updated_at"],
+    }

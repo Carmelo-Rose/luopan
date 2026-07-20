@@ -53,3 +53,16 @@ CREATE TABLE IF NOT EXISTS ranking_event (
 
 CREATE INDEX IF NOT EXISTS idx_event_notified
     ON ranking_event (notified, created_at);
+
+-- 详情页富化表：按需（只对飞书标记「待发布」的商品）打开商品详情页 PDP 抓到的
+-- 真实属性 + 详情图 + 主图集，供 auto_pdd 发布时用真实数据替代 AI 猜测 / 兜底占位。
+-- product_id 为主键，一个商品一行、重复富化就 upsert 覆盖（REPLACE）。
+-- 字段不定（不同类目属性种类不同），故属性/图片列统一存 JSON 文本，不拆宽表。
+CREATE TABLE IF NOT EXISTS product_enrichment (
+    product_id         TEXT PRIMARY KEY,          -- 抖音商品 ID（与 products_snapshot.product_id 同源）
+    attrs_json         TEXT NOT NULL DEFAULT '',  -- {属性名: 属性值} 的 JSON，如 {"材质":"ABS","产地":"中国大陆"}
+    detail_images_json TEXT NOT NULL DEFAULT '',  -- 详情图 URL 数组的 JSON（商品详情区图片，按页面顺序）
+    main_images_json   TEXT NOT NULL DEFAULT '',  -- 主图 URL 数组的 JSON（若抓到多张主图/白底图）
+    source_url         TEXT NOT NULL DEFAULT '',  -- 本次富化打开的 PDP URL
+    updated_at         TEXT NOT NULL              -- ISO datetime，最近一次富化时间
+);
