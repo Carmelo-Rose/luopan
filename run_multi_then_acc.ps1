@@ -13,12 +13,25 @@ function Run-Python {
     param([string]$Args, [string]$Log)
     # 用 cmd /c 调用，避免 PowerShell 把 Python stderr 包装成 ErrorRecord 干扰退出码
     cmd /c "`"$python`" $Args >> `"$Log`" 2>&1"
-    "`n[cron] $Args exit=$LASTEXITCODE $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -Append -Encoding utf8 -FilePath $Log
+    $code = $LASTEXITCODE
+    "`n[cron] $Args exit=$code $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -Append -Encoding utf8 -FilePath $Log
+    return $code
 }
 
 # ── ① 采集入库（不推送）──────────────────────────────────────────────
-Run-Python "run.py --multi --no-push" "data\cron_multi.log"
-Run-Python "run.py --acc --no-push"   "data\cron_acc.log"
+$multiCode = Run-Python "run.py --multi --no-push" "data\cron_multi.log"
+if ($multiCode -ne 0) {
+    "`n[cron] --multi 采集失败，跳过 --acc 和 flush，避免继续触发榜单接口风控或推送旧 sidecar" |
+        Out-File -Append -Encoding utf8 -FilePath 'data\cron_multi.log'
+    exit $multiCode
+}
+
+$accCode = Run-Python "run.py --acc --no-push" "data\cron_acc.log"
+if ($accCode -ne 0) {
+    "`n[cron] --acc 采集失败，跳过 flush，避免推送旧 sidecar" |
+        Out-File -Append -Encoding utf8 -FilePath 'data\cron_acc.log'
+    exit $accCode
+}
 
 # ── ② 睡到「触发 + 30 分钟」再推送 ───────────────────────────────────
 $target = $start.AddMinutes($pushDelayMinutes)

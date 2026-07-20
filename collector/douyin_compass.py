@@ -5,7 +5,7 @@
   - 使用 persistent_context 复用已登录 Chrome profile
   - 导航至真实榜单页，监听 XHR 响应拦截配置的榜单接口
   - 接口拦截失败时降级为 DOM 解析（tr 行）
-  - 翻页方式：直接调用接口 page_no 参数（不点击翻页按钮），每页拦截一次响应
+  - 翻页方式：优先点击页面分页按钮并监听页面自身 XHR，避免手工 fetch 触发风控
 """
 import asyncio
 import hashlib
@@ -116,6 +116,17 @@ def _apply_query_overrides(url: str, overrides: dict[str, str]) -> str:
         if value and key not in seen:
             result.append((key, value))
     return urlunparse(parsed._replace(query=urlencode(result)))
+
+
+def _api_error(payload: dict) -> tuple[str, str] | None:
+    """Return (key, message) for business-level API errors, otherwise None."""
+    for err_key in ("status_code", "code", "err_no", "errno"):
+        if err_key in payload and payload[err_key] != 0:
+            return (
+                f"{err_key}={payload[err_key]}",
+                payload.get("msg", payload.get("message", payload.get("status_msg", ""))),
+            )
+    return None
 
 
 # ── 字段解析 ──────────────────────────────────────────────────────────
@@ -404,6 +415,30 @@ class DouyinCompassCollector:
         # 从拦截到的首个 API 请求中提取的可复用请求头（反爬头）
         self._captured_headers: dict = {}
 
+    def _category_selection_labels(
+        self,
+        industry_name: str,
+        category_name: str,
+        category_id: str,
+    ) -> list[str]:
+        """Build the visible cascader label path for page-native category selection."""
+        labels: list[str] = []
+        if industry_name:
+            labels.append(industry_name)
+
+        ids = [s.strip() for s in (category_id or "").split(",") if s.strip()]
+        if len(ids) > 1:
+            for cid in ids:
+                entry = self._cat_lookup.get(cid) or {}
+                name = entry.get("leaf") or entry.get("l2") or entry.get("l3") or ""
+                if name and name not in labels:
+                    labels.append(name)
+        elif category_name and category_name not in labels:
+            labels.append(category_name)
+            labels.append("全部")
+
+        return labels
+
     async def __aenter__(self):
         self._playwright = await async_playwright().start()
         self._context = await self._playwright.chromium.launch_persistent_context(
@@ -550,8 +585,8 @@ class DouyinCompassCollector:
                 )
 
             for page_no in range(2, self.total_pages + 1):
-                products = await self._collect_page_via_api(
-                    page, captured_url, page_no, scope_key, captured_at, page_param,
+                products = await self._collect_page_via_ui(
+                    page, page_no, scope_key, captured_at,
                     industry_name=ind_name, category_name=cat_name,
                 )
                 if products is None:
@@ -688,6 +723,76 @@ class DouyinCompassCollector:
             elif label == tab_text:
                 logger.warning("未能点击榜单 tab「%s」，将回退页面默认 tab", label)
 
+    async def _select_category_via_cascader(self, page: Page, labels: list[str]) -> bool:
+        """Select category through the visible Aurora cascader so the page issues native XHR."""
+        if not labels:
+            return False
+        try:
+            cascader = page.locator(".aurora-cascader").locator("visible=true").first
+            await cascader.click(timeout=5000)
+            await page.wait_for_selector(".aurora-cascader-menus", timeout=10000)
+
+            for idx, label in enumerate(labels):
+                menus = page.locator(".aurora-cascader-menu")
+                for _ in range(20):
+                    if await menus.count() > idx:
+                        break
+                    await page.wait_for_timeout(300)
+                if await menus.count() <= idx:
+                    logger.warning("类目级联第 %d 列未出现，已选路径=%s", idx + 1, labels[:idx])
+                    return False
+
+                item = menus.nth(idx).locator(".aurora-cascader-menu-item", has_text=label).first
+                await item.scroll_into_view_if_needed(timeout=5000)
+                await item.click(timeout=5000)
+                await page.wait_for_timeout(800)
+
+            logger.info("已通过页面级联选择类目: %s", " > ".join(labels))
+            return True
+        except Exception as exc:
+            logger.warning("页面级联选择类目失败（%s）: %s", " > ".join(labels), exc)
+            return False
+
+    async def _wait_for_rank_response(
+        self,
+        page: Page,
+        timeout_ms: int = 15000,
+    ) -> tuple[list[dict], str] | None:
+        """Listen for the latest successful rank API response emitted by the page itself."""
+        hits: list[tuple[list[dict], str]] = []
+
+        async def on_response(resp: Response):
+            if not (_is_rank_api(resp.url) and resp.status == 200):
+                return
+            try:
+                payload = await resp.json()
+            except Exception:
+                return
+            err = _api_error(payload)
+            if err:
+                logger.error("页面原生 API 业务错误: %s, msg=%s", err[0], err[1])
+                return
+            card_list = _extract_cards(payload)
+            if not card_list:
+                logger.debug("页面原生 API 返回空/无效条目: %s", resp.url)
+                return
+            hits.append((card_list, resp.url))
+
+        page.on("response", on_response)
+        try:
+            waited = 0
+            step = 300
+            while waited < timeout_ms:
+                await page.wait_for_timeout(step)
+                waited += step
+                # Cascader selection may emit intermediate parent-category responses.
+                # Keep waiting briefly and use the latest hit.
+                if hits and waited >= 2500:
+                    return hits[-1]
+            return hits[-1] if hits else None
+        finally:
+            page.remove_listener("response", on_response)
+
     async def _collect_page1(
         self,
         page: Page,
@@ -699,109 +804,14 @@ class DouyinCompassCollector:
         category_name: str = "",
         _reuse_page: bool = False,
     ) -> tuple[list[dict], str]:
-        """
-        导航到榜单首页，拦截接口 URL 后切换为「实时」维度（date_type=1），
-        然后通过 page.evaluate fetch 直接请求实时数据。
-        返回 (商品列表, 实时 API URL)。
-        """
-        captured_url: str = ""
-        captured_headers: dict = {}
-        has_cached_base = bool(self._base_api_url)
-
-        async def on_response(resp: Response):
-            nonlocal captured_url, captured_headers
-            if _is_rank_api(resp.url) and resp.status == 200 and not captured_url:
-                try:
-                    body = await resp.json()
-                except Exception:
-                    return
-                card_list = _extract_cards(body)
-                if not card_list:
-                    logger.debug("跳过空/无效响应（无榜单条目）: %s", resp.url)
-                    return
-                captured_url = resp.url
-                try:
-                    captured_headers = _extract_forwardable_headers(
-                        resp.request.headers
-                    )
-                except Exception:
-                    captured_headers = {}
-                logger.debug(
-                    "捕获初始 API URL（%d 条数据）: %s", len(card_list), captured_url
-                )
-
-        # 构造目标 URL
-        nav_url = self.rank_url
-        if _reuse_page:
-            ind_id = industry_id or settings.INDUSTRY_ID
-            cat_id = category_id or settings.CATEGORY_ID
-            if ind_id and cat_id:
-                nav_url = _apply_query_overrides(
-                    self.rank_url,
-                    {"industry_id": ind_id, "category_id": cat_id},
-                )
-
-        page.on("response", on_response)
-        try:
-            if not _reuse_page:
-                logger.info("导航至榜单页: %s", self.rank_url)
-                await page.goto(self.rank_url, wait_until="domcontentloaded", timeout=60000)
-                # 榜单 tab 是纯前端状态、不在 URL 里：导航后点击目标 tab（如「短视频榜」），
-                # 否则 SPA 只会自动触发默认 tab（商品卡榜）的接口，捕获不到目标榜单。
-                await self._select_rank_tab(page)
-                # 首次加载：等待 SPA 自动触发 API（最多 20s）
-                for _ in range(40):
-                    if captured_url:
-                        break
-                    await asyncio.sleep(0.5)
-            else:
-                logger.info("切换类目，导航至: %s", nav_url)
-                await page.goto(nav_url, wait_until="domcontentloaded", timeout=60000)
-                if has_cached_base:
-                    # 已有 base URL，SPA 可能不重新触发 API，短等后直接用 fetch
-                    logger.info("已有缓存 API URL，短等 3s 后尝试手动 fetch")
-                    for _ in range(6):
-                        if captured_url:
-                            break
-                        await asyncio.sleep(0.5)
-                    if not captured_url:
-                        logger.info("SPA 未触发新 API 请求，将使用缓存 base URL + fetch")
-                else:
-                    # 无缓存（理论上不会发生，idx>1 时至少 idx=1 已缓存）
-                    for _ in range(40):
-                        if captured_url:
-                            break
-                        await asyncio.sleep(0.5)
-        finally:
-            page.remove_listener("response", on_response)
-
-        if captured_headers:
-            self._captured_headers = captured_headers
-            logger.debug("已缓存 %d 个请求头用于翻页", len(captured_headers))
-
+        """Navigate and collect page 1 via page-native category selection and XHR."""
         ind_id = industry_id or settings.INDUSTRY_ID
         cat_id = category_id or settings.CATEGORY_ID
 
-        # 选择 URL 来源：优先本次拦截，否则回退到缓存
-        url_source = captured_url or self._base_api_url
-        if not url_source:
-            return [], ""
+        logger.info("导航至榜单页: %s", self.rank_url)
+        await page.goto(self.rank_url, wait_until="domcontentloaded", timeout=60000)
+        await self._select_rank_tab(page)
 
-        if not captured_url and self._base_api_url:
-            logger.info("复用缓存 base API URL 构造新类目请求")
-            if not captured_headers:
-                captured_headers = dict(self._captured_headers)
-
-        # 覆盖类目参数（使用本次拦截的 URL 或缓存的 base URL）
-        realtime_url = _apply_query_overrides(
-            url_source,
-            {
-                "date_type": "1",
-                "industry_id": ind_id,
-                "category_id": cat_id,
-            },
-        )
-        logger.info("切换为实时维度: date_type=1")
         if ind_id and cat_id:
             logger.info(
                 "类目: %s>%s (industry_id=%s, category_id=%s)",
@@ -809,11 +819,79 @@ class DouyinCompassCollector:
                 ind_id, cat_id,
             )
 
-        products = await self._collect_page_via_api(
-            page, realtime_url, 1, scope_key, captured_at, "page_no",
+        labels = self._category_selection_labels(industry_name, category_name, cat_id)
+        hits: list[tuple[list[dict], str]] = []
+
+        async def on_response(resp: Response):
+            if not (_is_rank_api(resp.url) and resp.status == 200):
+                return
+            try:
+                payload = await resp.json()
+            except Exception:
+                return
+            err = _api_error(payload)
+            if err:
+                logger.error("页面原生 API 业务错误: %s, msg=%s", err[0], err[1])
+                return
+            card_list = _extract_cards(payload)
+            if card_list:
+                hits.append((card_list, resp.url))
+
+        page.on("response", on_response)
+        selected = await self._select_category_via_cascader(page, labels)
+        try:
+            await page.wait_for_timeout(4000)
+            hit = hits[-1] if hits else None
+        finally:
+            page.remove_listener("response", on_response)
+
+        if not selected or not hit:
+            return [], ""
+
+        card_list, captured_url = hit
+        products = _parse_card_list(
+            card_list, 1, self.page_size, scope_key, captured_at,
             industry_name=industry_name, category_name=category_name,
         )
-        return products or [], realtime_url
+        return products, captured_url
+
+    async def _collect_page_via_ui(
+        self,
+        page: Page,
+        page_no: int,
+        scope_key: str,
+        captured_at: str,
+        industry_name: str = "",
+        category_name: str = "",
+    ) -> Optional[list[dict]]:
+        """Click the page's own pagination control and parse the emitted XHR."""
+        waiter = asyncio.create_task(self._wait_for_rank_response(page, timeout_ms=15000))
+        try:
+            next_btn = page.locator(".aurora-pagination-next:visible").last
+            if await next_btn.count() == 0:
+                logger.warning("未找到页面分页 next 按钮")
+                waiter.cancel()
+                return None
+            cls = await next_btn.get_attribute("class") or ""
+            if "disabled" in cls:
+                waiter.cancel()
+                return []
+            await next_btn.click(timeout=10000)
+        except Exception as exc:
+            logger.error("第 %d 页分页点击失败: %s", page_no, exc)
+            waiter.cancel()
+            return None
+
+        hit = await waiter
+        if not hit:
+            logger.error("第 %d 页未捕获页面原生榜单 API", page_no)
+            return None
+
+        card_list, _ = hit
+        return _parse_card_list(
+            card_list, page_no, self.page_size, scope_key, captured_at,
+            industry_name=industry_name, category_name=category_name,
+        )
 
     async def _collect_page_via_api(
         self,

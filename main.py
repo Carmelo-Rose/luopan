@@ -287,6 +287,7 @@ async def run_multi(
                 return {
                     "run_id": run_id, "categories_collected": 0,
                     "total_products": 0, "all_events": [], "excel_path": "",
+                    "collection_failed": True,
                 }
 
             logger.info("共发现 %d 个二级类目待采集", len(categories))
@@ -416,6 +417,21 @@ async def run_multi(
                     "products": cat_total, "events": len(events),
                 })
 
+        if not mock and categories_collected == 0:
+            logger.error(
+                "本轮真实采集没有任何有效类目，疑似榜单接口风控或登录态失效；"
+                "跳过同步、推送和摘要落盘"
+            )
+            return {
+                "run_id": run_id,
+                "categories_collected": 0,
+                "total_products": 0,
+                "all_events": [],
+                "excel_path": "",
+                "category_results": category_results,
+                "collection_failed": True,
+            }
+
         # ── 详情页拓价已停用（2026-06-23）──────────────────────────
         # 价格列用脱敏价格带（price_bin，compute_diff 已回填）。原因：风控下逐条开详情页
         # 对几百条异动会空转 ~90 分钟且拿不到到手价（今日两次实测），拖垮定时窗口。
@@ -498,6 +514,7 @@ async def run_multi(
             "all_events": all_events,
             "excel_path": excel_path,
             "category_results": category_results,
+            "collection_failed": False,
         }
 
     finally:
@@ -933,7 +950,10 @@ async def run_acc(
         dump_path = os.path.join(settings.BASE_DIR, "data", "category_raw_dump.json")
         if not os.path.exists(dump_path):
             logger.error("类目原始树 dump 不存在: %s，请先运行 --discover 或 --multi 建立缓存", dump_path)
-            return {"run_id": run_id, "categories_collected": 0, "total_products": 0, "all_events": []}
+            return {
+                "run_id": run_id, "categories_collected": 0,
+                "total_products": 0, "all_events": [], "collection_failed": True,
+            }
         with open(dump_path, "r", encoding="utf-8") as f:
             raw_options = json.load(f)
 
@@ -941,7 +961,10 @@ async def run_acc(
         targets = resolve_leaf_targets(raw_options, settings.ACC_PATH, settings.ACC_LEAF_NAMES)
         if not targets:
             logger.error("未匹配到任何叶子类目目标，终止")
-            return {"run_id": run_id, "categories_collected": 0, "total_products": 0, "all_events": []}
+            return {
+                "run_id": run_id, "categories_collected": 0,
+                "total_products": 0, "all_events": [], "collection_failed": True,
+            }
 
     logger.info("服配支线目标: %s", [t["leaf_name"] for t in targets])
 
@@ -1043,6 +1066,19 @@ async def run_acc(
                     if idx < total:
                         await asyncio.sleep(3)
 
+        if not mock and categories_collected == 0:
+            logger.error(
+                "本轮服配真实采集没有任何有效叶子，疑似榜单接口风控或登录态失效；"
+                "跳过同步、推送和摘要落盘"
+            )
+            return {
+                "run_id": run_id,
+                "categories_collected": 0,
+                "total_products": 0,
+                "all_events": [],
+                "collection_failed": True,
+            }
+
         # ── 服配不做详情页拓价（运营决定，2026-06-23）──────────────────
         # 叶子直采后首轮即 5×TOP200≈千条 NEW_ENTRY，逐条开详情页拓价会撞风控空转数小时；
         # 配饰监控用脱敏价格带（price_bin，如 ¥59.9-¥89.9）已够用。价格列即 compute_diff
@@ -1095,6 +1131,7 @@ async def run_acc(
             "categories_collected": categories_collected,
             "total_products": total_products,
             "all_events": all_events,
+            "collection_failed": False,
         }
 
     finally:
@@ -1152,6 +1189,8 @@ def main() -> None:
             result["total_products"],
             len(result["all_events"]),
         )
+        if result.get("collection_failed"):
+            sys.exit(2)
         return
 
     if args.multi:
@@ -1172,6 +1211,8 @@ def main() -> None:
         )
         if result.get("excel_path"):
             logger.info("Excel 报告: %s", result["excel_path"])
+        if result.get("collection_failed"):
+            sys.exit(2)
     else:
         result = asyncio.run(
             run_once(
