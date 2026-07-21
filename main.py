@@ -234,7 +234,10 @@ async def _collect_main_category_with_retry(
                 "[%s] 首次采集仅 %d 条，换新页面后重试一次",
                 scope_key, len(products),
             )
-            await collector.reset_page()
+            try:
+                await collector.reset_page()
+            except Exception as exc:
+                logger.error("[%s] 重置重试页面失败，将交给下一次采集自愈: %s", scope_key, exc)
             await asyncio.sleep(retry_delay_seconds)
 
     logger.error("[%s] 两次采集均未达到 %d 条下限", scope_key, settings.MIN_PRODUCTS)

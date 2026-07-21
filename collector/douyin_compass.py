@@ -535,7 +535,29 @@ class DouyinCompassCollector:
         except Exception:
             logger.warning("关闭失败类目的页面时出现异常", exc_info=True)
 
-        self._page = await self._context.new_page()
+        try:
+            self._page = await self._context.new_page()
+        except Exception:
+            # A browser crash can close the context while the old Page object
+            # still looks usable. Recreate the persistent context as a fallback.
+            logger.warning("浏览器上下文已关闭，重启后再准备重试页面", exc_info=True)
+            try:
+                if self._context:
+                    await self._context.close()
+            except Exception:
+                pass
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=self.user_data_dir,
+                channel=self.channel if self.channel != "chromium" else None,
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_https_errors=True,
+            )
+            self._page = (
+                self._context.pages[0]
+                if self._context.pages
+                else await self._context.new_page()
+            )
         self._base_api_url = ""
         self._base_api_params = {}
         self._captured_headers = {}
