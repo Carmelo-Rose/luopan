@@ -525,6 +525,22 @@ class DouyinCompassCollector:
         self._captured_headers = {}
         logger.info("浏览器上下文已重启，继续采集")
 
+    async def reset_page(self) -> None:
+        """Replace the shared tab after a category-level collection failure."""
+        await self._ensure_browser_alive()
+        old_page = self._page
+        try:
+            if old_page is not None and not old_page.is_closed():
+                await old_page.close()
+        except Exception:
+            logger.warning("关闭失败类目的页面时出现异常", exc_info=True)
+
+        self._page = await self._context.new_page()
+        self._base_api_url = ""
+        self._base_api_params = {}
+        self._captured_headers = {}
+        logger.info("已新建页面，准备重试当前类目")
+
     async def collect(
         self,
         scope_key: str = "card_order",

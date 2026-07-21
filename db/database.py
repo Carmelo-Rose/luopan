@@ -76,11 +76,30 @@ def insert_snapshot(conn: sqlite3.Connection, run_id: str, rows: list[dict]) -> 
     """
     # 防御性默认：旧调用方/测试可能不带新字段，统一补空避免绑定缺参
     data = [
-        {"category_l3_name": "", "leaf_category_name": "", "image": "", "shop_info": "", **r, "run_id": run_id}
+        {
+            "industry_name": "", "category_name": "", "category_l3_name": "",
+            "leaf_category_name": "", "image": "", "shop_info": "", **r,
+            "run_id": run_id,
+        }
         for r in rows
     ]
     conn.executemany(sql, data)
     conn.commit()
+
+
+def discard_run(conn: sqlite3.Connection, run_id: str, scope_prefix: str) -> tuple[int, int]:
+    """Remove a failed partial run so it cannot affect later diffs or notifications."""
+    pattern = scope_prefix + "%"
+    event_count = conn.execute(
+        "DELETE FROM ranking_event WHERE run_id=? AND scope_key LIKE ?",
+        (run_id, pattern),
+    ).rowcount
+    snapshot_count = conn.execute(
+        "DELETE FROM products_snapshot WHERE run_id=? AND scope_key LIKE ?",
+        (run_id, pattern),
+    ).rowcount
+    conn.commit()
+    return snapshot_count, event_count
 
 
 # ── 快照查询 ──────────────────────────────────────────────────────────
@@ -193,8 +212,8 @@ def insert_events(conn: sqlite3.Connection, events: list[dict]) -> int:
     """
     # 防御性默认：旧调用方/测试可能不带新字段，统一补空避免绑定缺参
     data = [
-        {"category_l3_name": "", "leaf_category_name": "",
-         "image": "", "shop_info": "", "pay_amount": "", "price": "", **e}
+        {"industry_name": "", "category_name": "", "category_l3_name": "", "leaf_category_name": "",
+            "image": "", "shop_info": "", "pay_amount": "", "price": "", **e}
         for e in events
     ]
     before = conn.total_changes

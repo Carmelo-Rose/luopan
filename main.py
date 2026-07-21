@@ -203,6 +203,44 @@ async def run_once(
 
 # ── 多类目流程 ────────────────────────────────────────────────────────
 
+async def _collect_main_category_with_retry(
+    collector,
+    category: dict,
+    scope_key: str,
+    reuse_page: bool,
+    retry_delay_seconds: float = 2,
+) -> list[dict]:
+    """Collect a main-lane category twice at most, isolating a failed first tab."""
+    products: list[dict] = []
+    for attempt in range(2):
+        try:
+            products = await collector.collect(
+                scope_key=scope_key,
+                industry_id=category.get("industry_id", ""),
+                category_id=category.get("category_id", ""),
+                industry_name=category.get("industry_name", ""),
+                category_name=category.get("category_name", ""),
+                _reuse_page=reuse_page or attempt > 0,
+            )
+        except Exception as exc:
+            logger.error("[%s] 采集异常（第 %d 次）: %s", scope_key, attempt + 1, exc)
+            products = []
+
+        if len(products) >= settings.MIN_PRODUCTS:
+            return products
+
+        if attempt == 0:
+            logger.warning(
+                "[%s] 首次采集仅 %d 条，换新页面后重试一次",
+                scope_key, len(products),
+            )
+            await collector.reset_page()
+            await asyncio.sleep(retry_delay_seconds)
+
+    logger.error("[%s] 两次采集均未达到 %d 条下限", scope_key, settings.MIN_PRODUCTS)
+    return []
+
+
 async def run_multi(
     dry_run: bool = False,
     mock: bool = False,
@@ -236,6 +274,7 @@ async def run_multi(
     baseline_count = 0
     excel_path = ""
     category_results: list[dict] = []
+    failed_categories: list[str] = []
 
     try:
         if not do_collect:
@@ -303,22 +342,9 @@ async def run_multi(
                     scope_key = f"{scope_prefix}_{ind_name}_{cat_name}"
 
                     logger.info("═══ [%d/%d] 采集 %s > %s ═══", idx, total_cats, ind_name, cat_name)
-                    try:
-                        products = await collector.collect(
-                            scope_key=scope_key,
-                            industry_id=ind_id,
-                            category_id=cat_id,
-                            industry_name=ind_name,
-                            category_name=cat_name,
-                            _reuse_page=(idx > 1),
-                        )
-                    except Exception as e:
-                        logger.error("[%d/%d] %s > %s 采集异常: %s", idx, total_cats, ind_name, cat_name, e)
-                        category_results.append({
-                            "industry_name": ind_name, "category_name": cat_name,
-                            "status": "采集异常", "products": 0, "events": 0,
-                        })
-                        continue
+                    products = await _collect_main_category_with_retry(
+                        collector, cat, scope_key, reuse_page=(idx > 1),
+                    )
 
                     logger.info("[%d/%d] %s > %s 完成: %d 条", idx, total_cats, ind_name, cat_name, len(products))
 
@@ -330,6 +356,7 @@ async def run_multi(
                             "industry_name": ind_name, "category_name": cat_name,
                             "status": "采集失败", "products": cat_total, "events": 0,
                         })
+                        failed_categories.append(scope_key)
                         continue
 
                     categories_collected += 1
@@ -416,6 +443,23 @@ async def run_multi(
                     "status": "有异动" if events else "无异动",
                     "products": cat_total, "events": len(events),
                 })
+
+        if not mock and failed_categories:
+            snapshots, events = database.discard_run(conn, run_id, scope_prefix)
+            logger.error(
+                "本轮有 %d 个类目在重试后仍失败，已丢弃本轮部分数据，"
+                "不覆盖飞书也不推送。失败类目: %s；清理快照=%d，事件=%d",
+                len(failed_categories), failed_categories, snapshots, events,
+            )
+            return {
+                "run_id": run_id,
+                "categories_collected": categories_collected,
+                "total_products": total_products,
+                "all_events": [],
+                "excel_path": "",
+                "category_results": category_results,
+                "collection_failed": True,
+            }
 
         if not mock and categories_collected == 0:
             logger.error(
