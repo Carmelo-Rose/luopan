@@ -530,6 +530,7 @@ async def run_multi(
             _save_summary_sidecar(
                 "multi", run_id, ts, categories_collected, category_results,
                 scope_prefix=scope_prefix, new_event_count=len(all_events),
+                categories_expected=len(categories),
             )
         else:
             excel_path = _finalize_multi_push(
@@ -754,13 +755,19 @@ def _summary_sidecar_path(lane: str) -> str:
 def _save_summary_sidecar(
     lane: str, run_id: str, ts: datetime,
     categories_collected: int, category_results: list[dict],
-    scope_prefix: str = "", new_event_count: int = 0,
+    scope_prefix: str = "", new_event_count: int = 0, categories_expected: int = 0,
 ) -> None:
-    """采集完成（--no-push）后落盘摘要上下文，供后续 --flush 还原推送。"""
+    """采集完成（--no-push）后落盘摘要上下文，供后续 --flush 还原推送。
+
+    categories_expected 是本轮实际目标类目数（已过滤 EXCLUDE_L2_CATEGORIES 等配置排除项），
+    供外部风控看板同步脚本判断"是否有类目真的采集失败"，避免它们各自维护一份容易过期的
+    硬编码期望值。
+    """
     data = {
         "run_id": run_id,
         "ts": ts.isoformat(),
         "categories_collected": categories_collected,
+        "categories_expected": categories_expected,
         "category_results": category_results,
         "scope_prefix": scope_prefix,
     }
@@ -1162,6 +1169,7 @@ async def run_acc(
             _save_summary_sidecar(
                 "acc", run_id, ts, categories_collected, [],
                 scope_prefix=scope_prefix, new_event_count=len(all_events),
+                categories_expected=len(targets),
             )
         else:
             _finalize_acc_push(
