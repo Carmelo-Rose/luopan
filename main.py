@@ -203,14 +203,68 @@ async def run_once(
 
 # ── 多类目流程 ────────────────────────────────────────────────────────
 
+async def _retry_after_rate_limit(
+    collector, category: dict, scope_key: str,
+) -> tuple[list[dict], bool]:
+    """撞限流（RateLimitError）后的专用退避重试。
+
+    限流是账号/接口级的冷却，换新页面没用，只能等；因此不复用固定 2s 换页重试，
+    而是沿 settings.RATE_LIMIT_BACKOFFS 逐级拉长等待。全部退避完仍失败，判该类目
+    失败并向上报告"因限流失败"，供调用方驱动跨类目熔断。
+    """
+    from collector.douyin_compass import RateLimitError
+
+    backoffs = settings.RATE_LIMIT_BACKOFFS
+    for i, delay in enumerate(backoffs, start=1):
+        logger.warning(
+            "[%s] 限流退避 %.0fs 后重试（第 %d/%d 次）", scope_key, delay, i, len(backoffs),
+        )
+        await asyncio.sleep(delay)
+        try:
+            products = await collector.collect(
+                scope_key=scope_key,
+                industry_id=category.get("industry_id", ""),
+                category_id=category.get("category_id", ""),
+                industry_name=category.get("industry_name", ""),
+                category_name=category.get("category_name", ""),
+                _reuse_page=True,
+            )
+        except RateLimitError as exc:
+            logger.warning("[%s] 退避后仍撞限流（%s）", scope_key, exc)
+            continue
+        except Exception as exc:
+            logger.error("[%s] 限流退避重试异常: %s", scope_key, exc)
+            continue
+
+        if len(products) >= settings.MIN_PRODUCTS:
+            logger.info("[%s] 限流退避后恢复采集", scope_key)
+            return products, False
+
+    logger.error("[%s] 限流退避 %d 次后仍失败，判定该类目失败", scope_key, len(backoffs))
+    return [], True
+
+
 async def _collect_main_category_with_retry(
     collector,
     category: dict,
     scope_key: str,
     reuse_page: bool,
     retry_delay_seconds: float = 2,
-) -> list[dict]:
-    """Collect a main-lane category twice at most, isolating a failed first tab."""
+) -> tuple[list[dict], bool]:
+    """Collect a main-lane category, retrying on failure.
+
+    普通失败（网络抖动等）：换新页面固定延迟重试一次（原有行为不变）。
+    限流失败（RateLimitError，如抖音 code=11001）：转入 _retry_after_rate_limit
+    的逐级退避重试，而不是白白多打一次请求。
+
+    Returns
+    -------
+    (products, rate_limited)
+        rate_limited 仅在该类目最终失败且失败原因是限流时为 True，供调用方统计
+        连续限流次数、驱动熔断。
+    """
+    from collector.douyin_compass import RateLimitError
+
     products: list[dict] = []
     for attempt in range(2):
         try:
@@ -222,12 +276,15 @@ async def _collect_main_category_with_retry(
                 category_name=category.get("category_name", ""),
                 _reuse_page=reuse_page or attempt > 0,
             )
+        except RateLimitError as exc:
+            logger.warning("[%s] 撞限流（%s），转入限流退避重试", scope_key, exc)
+            return await _retry_after_rate_limit(collector, category, scope_key)
         except Exception as exc:
             logger.error("[%s] 采集异常（第 %d 次）: %s", scope_key, attempt + 1, exc)
             products = []
 
         if len(products) >= settings.MIN_PRODUCTS:
-            return products
+            return products, False
 
         if attempt == 0:
             logger.warning(
@@ -241,7 +298,7 @@ async def _collect_main_category_with_retry(
             await asyncio.sleep(retry_delay_seconds)
 
     logger.error("[%s] 两次采集均未达到 %d 条下限", scope_key, settings.MIN_PRODUCTS)
-    return []
+    return [], False
 
 
 async def run_multi(
@@ -287,6 +344,13 @@ async def run_multi(
             f_ts = sc.get("ts", ts)
             f_cat = sc.get("categories_collected", 0)
             f_cr = sc.get("category_results", [])
+            if sc.get("collection_failed"):
+                logger.warning("[multi] 上一轮采集失败，跳过 flush 推送")
+                return {
+                    "run_id": f_run_id, "categories_collected": f_cat,
+                    "total_products": 0, "all_events": [], "excel_path": "",
+                    "collection_failed": True,
+                }
             if not dry_run:
                 excel_path = _finalize_multi_push(conn, f_run_id, f_ts, f_cat, f_cr)
             logger.info("═══ flush 推送完成（多类目）═══")
@@ -326,6 +390,11 @@ async def run_multi(
             categories = await _resolve_categories()
             if not categories:
                 logger.error("未发现任何目标类目，终止")
+                if not dry_run:
+                    _save_summary_sidecar(
+                        "multi", run_id, ts, 0, [], scope_prefix=scope_prefix,
+                        categories_expected=0, collection_failed=True,
+                    )
                 return {
                     "run_id": run_id, "categories_collected": 0,
                     "total_products": 0, "all_events": [], "excel_path": "",
@@ -337,6 +406,9 @@ async def run_multi(
             import asyncio as _aio
             async with DouyinCompassCollector() as collector:
                 total_cats = len(categories)
+                # 连续因限流失败的类目数；达到 RATE_LIMIT_CIRCUIT_BREAK 即提前熔断本轮，
+                # 避免在明显的限流冷却期内继续空耗请求、拖长冷却恢复时间。
+                consecutive_rate_limited = 0
                 for idx, cat in enumerate(categories, 1):
                     ind_name = cat.get("industry_name", "")
                     cat_name = cat.get("category_name", "")
@@ -345,7 +417,7 @@ async def run_multi(
                     scope_key = f"{scope_prefix}_{ind_name}_{cat_name}"
 
                     logger.info("═══ [%d/%d] 采集 %s > %s ═══", idx, total_cats, ind_name, cat_name)
-                    products = await _collect_main_category_with_retry(
+                    products, rate_limited = await _collect_main_category_with_retry(
                         collector, cat, scope_key, reuse_page=(idx > 1),
                     )
 
@@ -360,8 +432,26 @@ async def run_multi(
                             "status": "采集失败", "products": cat_total, "events": 0,
                         })
                         failed_categories.append(scope_key)
+
+                        consecutive_rate_limited = consecutive_rate_limited + 1 if rate_limited else 0
+                        if consecutive_rate_limited >= settings.RATE_LIMIT_CIRCUIT_BREAK:
+                            remaining = categories[idx:]
+                            logger.error(
+                                "连续 %d 个类目撞限流，提前熔断本轮，剩余 %d 个类目一并计入失败",
+                                consecutive_rate_limited, len(remaining),
+                            )
+                            for rc in remaining:
+                                r_ind = rc.get("industry_name", "")
+                                r_cat = rc.get("category_name", "")
+                                category_results.append({
+                                    "industry_name": r_ind, "category_name": r_cat,
+                                    "status": "采集失败(熔断跳过)", "products": 0, "events": 0,
+                                })
+                                failed_categories.append(f"{scope_prefix}_{r_ind}_{r_cat}")
+                            break
                         continue
 
+                    consecutive_rate_limited = 0
                     categories_collected += 1
                     total_products += cat_total
                     logger.info("[%s] 写入快照 (%d 条)", scope_key, cat_total)
@@ -447,28 +537,17 @@ async def run_multi(
                     "products": cat_total, "events": len(events),
                 })
 
-        if not mock and failed_categories:
-            snapshots, events = database.discard_run(conn, run_id, scope_prefix)
-            logger.error(
-                "本轮有 %d 个类目在重试后仍失败，已丢弃本轮部分数据，"
-                "不覆盖飞书也不推送。失败类目: %s；清理快照=%d，事件=%d",
-                len(failed_categories), failed_categories, snapshots, events,
-            )
-            return {
-                "run_id": run_id,
-                "categories_collected": categories_collected,
-                "total_products": total_products,
-                "all_events": [],
-                "excel_path": "",
-                "category_results": category_results,
-                "collection_failed": True,
-            }
-
         if not mock and categories_collected == 0:
             logger.error(
                 "本轮真实采集没有任何有效类目，疑似榜单接口风控或登录态失效；"
                 "跳过同步、推送和摘要落盘"
             )
+            if not dry_run:
+                _save_summary_sidecar(
+                    "multi", run_id, ts, 0, category_results,
+                    scope_prefix=scope_prefix, categories_expected=len(categories),
+                    collection_failed=True,
+                )
             return {
                 "run_id": run_id,
                 "categories_collected": 0,
@@ -478,6 +557,17 @@ async def run_multi(
                 "category_results": category_results,
                 "collection_failed": True,
             }
+
+        if not mock and failed_categories:
+            # 部分类目撞限流：不再整轮丢弃。已成功的类目照常写库、算差分、推送；
+            # 失败的类目本轮跳过、沿用各自上次基线，下一轮再补（scope_key 级差分本就
+            # 互相独立）。失败清单会体现在 category_results 里的「采集失败」状态，
+            # 下游推送（企微摘要「覆盖状态」行、Excel、风控看板）据此如实展示失败数量。
+            logger.warning(
+                "本轮有 %d 个类目撞限流未采集成功，沿用各自上次基线；"
+                "其余 %d 个类目正常写入并推送。失败类目: %s",
+                len(failed_categories), categories_collected, failed_categories,
+            )
 
         # ── 详情页拓价已停用（2026-06-23）──────────────────────────
         # 价格列用脱敏价格带（price_bin，compute_diff 已回填）。原因：风控下逐条开详情页
@@ -756,6 +846,7 @@ def _save_summary_sidecar(
     lane: str, run_id: str, ts: datetime,
     categories_collected: int, category_results: list[dict],
     scope_prefix: str = "", new_event_count: int = 0, categories_expected: int = 0,
+    collection_failed: bool = False,
 ) -> None:
     """采集完成（--no-push）后落盘摘要上下文，供后续 --flush 还原推送。
 
@@ -770,13 +861,17 @@ def _save_summary_sidecar(
         "categories_expected": categories_expected,
         "category_results": category_results,
         "scope_prefix": scope_prefix,
+        "collection_failed": collection_failed,
     }
     try:
         with open(_summary_sidecar_path(lane), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
-        logger.info(
-            "[%s] --no-push 采集入库完成，%d 条新事件待 flush 推送", lane, new_event_count,
-        )
+        if collection_failed:
+            logger.warning("[%s] 采集失败摘要已落盘，后续 flush 将跳过推送", lane)
+        else:
+            logger.info(
+                "[%s] --no-push 采集入库完成，%d 条新事件待 flush 推送", lane, new_event_count,
+            )
     except Exception as e:
         logger.warning("[%s] 写入待推送 sidecar 失败: %s", lane, e)
 
@@ -978,6 +1073,13 @@ async def run_acc(
             f_run_id = sc.get("run_id", run_id)
             f_ts = sc.get("ts", ts)
             f_cat = sc.get("categories_collected", 0)
+            if sc.get("collection_failed"):
+                logger.warning("[acc] 上一轮采集失败，跳过 flush 推送")
+                return {
+                    "run_id": f_run_id, "categories_collected": f_cat,
+                    "total_products": 0, "all_events": [],
+                    "collection_failed": True,
+                }
             if not dry_run:
                 _finalize_acc_push(conn, f_run_id, f_ts, f_cat, scope_prefix)
             logger.info("═══ flush 推送完成（服配支线）═══")
@@ -1004,6 +1106,11 @@ async def run_acc(
         dump_path = os.path.join(settings.BASE_DIR, "data", "category_raw_dump.json")
         if not os.path.exists(dump_path):
             logger.error("类目原始树 dump 不存在: %s，请先运行 --discover 或 --multi 建立缓存", dump_path)
+            if not dry_run:
+                _save_summary_sidecar(
+                    "acc", run_id, ts, 0, [], scope_prefix=scope_prefix,
+                    categories_expected=0, collection_failed=True,
+                )
             return {
                 "run_id": run_id, "categories_collected": 0,
                 "total_products": 0, "all_events": [], "collection_failed": True,
@@ -1015,6 +1122,11 @@ async def run_acc(
         targets = resolve_leaf_targets(raw_options, settings.ACC_PATH, settings.ACC_LEAF_NAMES)
         if not targets:
             logger.error("未匹配到任何叶子类目目标，终止")
+            if not dry_run:
+                _save_summary_sidecar(
+                    "acc", run_id, ts, 0, [], scope_prefix=scope_prefix,
+                    categories_expected=0, collection_failed=True,
+                )
             return {
                 "run_id": run_id, "categories_collected": 0,
                 "total_products": 0, "all_events": [], "collection_failed": True,
@@ -1125,6 +1237,11 @@ async def run_acc(
                 "本轮服配真实采集没有任何有效叶子，疑似榜单接口风控或登录态失效；"
                 "跳过同步、推送和摘要落盘"
             )
+            if not dry_run:
+                _save_summary_sidecar(
+                    "acc", run_id, ts, 0, [], scope_prefix=scope_prefix,
+                    categories_expected=len(targets), collection_failed=True,
+                )
             return {
                 "run_id": run_id,
                 "categories_collected": 0,

@@ -616,28 +616,36 @@ def resolve_leaf_targets(
     # 真实二级类目名（path[1]），写入快照的 category_name 列，与大盘语义一致。
     l2_name = path[1] if len(path) >= 2 else path[0]
 
-    # 匹配叶子
-    leaf_set = set(leaf_names)
-    results: list[dict] = []
+    # 匹配叶子：按 leaf_names 的配置顺序输出（即优先级顺序），不按站点原始树的
+    # 子节点顺序。服配支线是限流时「跑到哪算哪」，采集顺序即事实上的优先级——
+    # 若沿用原始树顺序，配置里排第一的叶子（如「帽子」）可能在站点树里排到中间，
+    # 配额耗尽时反而先于低优先级叶子掉线（2026-07-29 实测：帽子被排到第 4 个）。
+    children_by_name = {}
     for child in (parent_node.get("children") or []):
-        child_name = _clean_label(child)
-        if child_name in leaf_set:
-            leaf_id = _node_id(child)
-            results.append({
-                "industry_name": path[0],
-                "category_name": l2_name,
-                "leaf_name": child_name,
-                "industry_id": l1_id,
-                "category_id": l2_id,
-                "leaf_category_id": leaf_id,
-                # 榜单 API 用的完整类目路径 L2,L3,...,叶子（直采该叶子 TOP200）
-                "rank_category_id": f"{cat_path},{leaf_id}" if cat_path else leaf_id,
-            })
-            leaf_set.discard(child_name)
+        children_by_name.setdefault(_clean_label(child), child)
 
-    if leaf_set:
+    results: list[dict] = []
+    unmatched: list[str] = []
+    for leaf_name in leaf_names:
+        child = children_by_name.get(leaf_name)
+        if not child:
+            unmatched.append(leaf_name)
+            continue
+        leaf_id = _node_id(child)
+        results.append({
+            "industry_name": path[0],
+            "category_name": l2_name,
+            "leaf_name": leaf_name,
+            "industry_id": l1_id,
+            "category_id": l2_id,
+            "leaf_category_id": leaf_id,
+            # 榜单 API 用的完整类目路径 L2,L3,...,叶子（直采该叶子 TOP200）
+            "rank_category_id": f"{cat_path},{leaf_id}" if cat_path else leaf_id,
+        })
+
+    if unmatched:
         logger.warning("resolve_leaf_targets: 未匹配到的叶子: %s（可能已更名或无权限）",
-                       sorted(leaf_set))
+                       unmatched)
 
     logger.info("resolve_leaf_targets: 路径 %s → 匹配 %d/%d 个叶子: %s",
                 " > ".join(path), len(results), len(leaf_names),

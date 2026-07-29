@@ -129,6 +129,27 @@ def _api_error(payload: dict) -> tuple[str, str] | None:
     return None
 
 
+# ── 风控限流识别 ───────────────────────────────────────────────────────
+# 榜单接口在触发限流时返回的业务错误码（观测自 2026-07-20/24 两次服务机撞风控）。
+# 与其它业务错误（登录失效、参数错误等）区分开，因为限流值得退避重试，其它错误不值得。
+_RATE_LIMIT_CODES = {"11001", "10001010a"}
+
+
+def _is_rate_limit_error(err: tuple[str, str]) -> bool:
+    """err 形如 ('code=11001', '请求过于频繁，请稍后再试')。"""
+    value = err[0].split("=", 1)[-1].strip().lower()
+    return value in _RATE_LIMIT_CODES
+
+
+class RateLimitError(Exception):
+    """榜单接口返回限流类业务错误码时抛出，供上层区分「值得退避重试」与普通失败。"""
+
+    def __init__(self, code: str, message: str = ""):
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
 def _norm_label(text: str) -> str:
     """Normalize cascader labels for exact matching across whitespace variants."""
     return re.sub(r"\s+", "", text or "").strip()
@@ -434,6 +455,8 @@ class DouyinCompassCollector:
         self._base_api_url: str = ""
         # 从拦截到的首个 API 请求中提取的可复用请求头（反爬头）
         self._captured_headers: dict = {}
+        # 最近一次 _wait_for_rank_response 捕获到的限流错误（(code, msg)），无则为 None
+        self._last_rate_limit: tuple[str, str] | None = None
 
     def _category_selection_labels(
         self,
@@ -853,6 +876,7 @@ class DouyinCompassCollector:
     ) -> tuple[list[dict], str] | None:
         """Listen for the latest successful rank API response emitted by the page itself."""
         hits: list[tuple[list[dict], str]] = []
+        self._last_rate_limit = None
 
         async def on_response(resp: Response):
             if not (_is_rank_api(resp.url) and resp.status == 200):
@@ -869,6 +893,8 @@ class DouyinCompassCollector:
             err = _api_error(payload)
             if err:
                 logger.error("页面原生 API 业务错误: %s, msg=%s", err[0], err[1])
+                if _is_rate_limit_error(err):
+                    self._last_rate_limit = err
                 return
             card_list = _extract_cards(payload)
             if not card_list:
@@ -936,6 +962,9 @@ class DouyinCompassCollector:
         if not selected or not hit:
             if not waiter.done():
                 waiter.cancel()
+            if self._last_rate_limit:
+                code, msg = self._last_rate_limit
+                raise RateLimitError(code, msg)
             return [], ""
 
         card_list, captured_url = hit
@@ -975,6 +1004,9 @@ class DouyinCompassCollector:
         hit = await waiter
         if not hit:
             logger.error("第 %d 页未捕获页面原生榜单 API", page_no)
+            if self._last_rate_limit:
+                code, msg = self._last_rate_limit
+                raise RateLimitError(code, msg)
             return None
 
         card_list, _ = hit

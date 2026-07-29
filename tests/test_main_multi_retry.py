@@ -1,9 +1,12 @@
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
+import main
+from collector.douyin_compass import RateLimitError
 from config import settings
 from db import database
-from main import _collect_main_category_with_retry
+from main import _collect_main_category_with_retry, _load_summary_sidecar, _save_summary_sidecar
 
 
 def _category():
@@ -20,13 +23,14 @@ def test_main_category_retries_on_empty_result(monkeypatch):
     collector = AsyncMock()
     collector.collect.side_effect = [[], [{}, {}, {}]]
 
-    products = asyncio.run(
+    products, rate_limited = asyncio.run(
         _collect_main_category_with_retry(
             collector, _category(), "video_order_test", False, retry_delay_seconds=0,
         )
     )
 
     assert len(products) == 3
+    assert rate_limited is False
     assert collector.collect.await_count == 2
     collector.reset_page.assert_awaited_once()
 
@@ -36,13 +40,14 @@ def test_main_category_retries_on_exception(monkeypatch):
     collector = AsyncMock()
     collector.collect.side_effect = [RuntimeError("transient"), [{}, {}]]
 
-    products = asyncio.run(
+    products, rate_limited = asyncio.run(
         _collect_main_category_with_retry(
             collector, _category(), "video_order_test", True, retry_delay_seconds=0,
         )
     )
 
     assert len(products) == 2
+    assert rate_limited is False
     assert collector.collect.await_count == 2
     collector.reset_page.assert_awaited_once()
 
@@ -52,15 +57,57 @@ def test_main_category_returns_empty_after_second_incomplete_result(monkeypatch)
     collector = AsyncMock()
     collector.collect.side_effect = [[{}], [{}, {}]]
 
-    products = asyncio.run(
+    products, rate_limited = asyncio.run(
         _collect_main_category_with_retry(
             collector, _category(), "video_order_test", False, retry_delay_seconds=0,
         )
     )
 
     assert products == []
+    assert rate_limited is False
     assert collector.collect.await_count == 2
     collector.reset_page.assert_awaited_once()
+
+
+def test_main_category_rate_limit_recovers_after_backoff(monkeypatch):
+    monkeypatch.setattr(settings, "MIN_PRODUCTS", 2)
+    monkeypatch.setattr(settings, "RATE_LIMIT_BACKOFFS", [0, 0, 0])
+    collector = AsyncMock()
+    collector.collect.side_effect = [
+        RateLimitError("code=11001", "请求过于频繁"),
+        RateLimitError("code=11001", "请求过于频繁"),
+        [{}, {}],
+    ]
+
+    products, rate_limited = asyncio.run(
+        _collect_main_category_with_retry(
+            collector, _category(), "video_order_test", False, retry_delay_seconds=0,
+        )
+    )
+
+    assert len(products) == 2
+    assert rate_limited is False
+    # 第 1 次撞限流即转入退避重试，不走「换新页面固定重试」那条路
+    collector.reset_page.assert_not_awaited()
+    assert collector.collect.await_count == 3
+
+
+def test_main_category_rate_limit_exhausts_backoff(monkeypatch):
+    monkeypatch.setattr(settings, "MIN_PRODUCTS", 2)
+    monkeypatch.setattr(settings, "RATE_LIMIT_BACKOFFS", [0, 0])
+    collector = AsyncMock()
+    collector.collect.side_effect = RateLimitError("code=11001", "请求过于频繁")
+
+    products, rate_limited = asyncio.run(
+        _collect_main_category_with_retry(
+            collector, _category(), "video_order_test", False, retry_delay_seconds=0,
+        )
+    )
+
+    assert products == []
+    assert rate_limited is True
+    # 首次 + 2 档退避 = 3 次调用
+    assert collector.collect.await_count == 3
 
 
 def _snapshot(scope_key):
@@ -110,3 +157,25 @@ def test_discard_run_removes_only_the_failed_lane(tmp_path):
         assert [row["scope_key"] for row in remaining] == ["video_acc_test"]
     finally:
         conn.close()
+
+
+def test_failed_summary_sidecar_marks_flush_as_blocked(monkeypatch, tmp_path):
+    sidecar_path = tmp_path / "pending_summary_multi.json"
+    monkeypatch.setattr(main, "_summary_sidecar_path", lambda lane: str(sidecar_path))
+
+    _save_summary_sidecar(
+        "multi",
+        "failed-run",
+        datetime(2026, 7, 24, tzinfo=timezone.utc),
+        categories_collected=13,
+        category_results=[{"status": "采集失败"}],
+        scope_prefix="video_order",
+        categories_expected=19,
+        collection_failed=True,
+    )
+
+    sidecar = _load_summary_sidecar("multi")
+
+    assert sidecar["collection_failed"] is True
+    assert sidecar["categories_collected"] == 13
+    assert sidecar["categories_expected"] == 19

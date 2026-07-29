@@ -98,6 +98,17 @@ CATEGORY_LOOKUP_CACHE: str = os.getenv(
 # 拒绝写入残缺快照，避免污染差分。默认 = 满额的 80%。
 MIN_PRODUCTS: int = _safe_int("MIN_PRODUCTS", int(PAGE_SIZE * TOTAL_PAGES * 0.8))
 
+# ── 限流退避 + 熔断（2026-07-24 加，应对榜单接口 code=11001 请求过于频繁）──────
+# 单类目撞限流（RateLimitError）时的逐级退避秒数；每重试一次用下一档，用完仍失败才判该
+# 类目失败。普通异常（网络抖动等）不走这套，维持原有固定 2s×1 次重试。
+_RATE_LIMIT_BACKOFFS_RAW = os.getenv("RATE_LIMIT_BACKOFFS", "30,60,120").strip()
+RATE_LIMIT_BACKOFFS: list[float] = [
+    float(s.strip()) for s in _RATE_LIMIT_BACKOFFS_RAW.split(",") if s.strip()
+]
+# 连续多少个类目因限流判定失败后，本轮提前熔断停止（剩余类目一并计入失败，走现有整轮
+# 丢弃逻辑），避免在明显限流冷却期内继续空耗请求、拖长冷却恢复时间。
+RATE_LIMIT_CIRCUIT_BREAK: int = _safe_int("RATE_LIMIT_CIRCUIT_BREAK", 3)
+
 # ── 推送 ──────────────────────────────────────────────────────────────
 NOTIFY_CHANNEL: str = os.getenv("NOTIFY_CHANNEL", "wecom") or "none"
 WECOM_WEBHOOK_URL: str = os.getenv("WECOM_WEBHOOK_URL", "")
