@@ -584,23 +584,27 @@ async def run_multi(
         #         updated = database.update_event_prices(conn, run_id, price_map)
         #         logger.info("详情页价格回填 DB: %d 条", updated)
 
-        # ── 飞书 Base 同步：采集即写（与企微推送时序解耦）────────────────────
-        # 让在线表在「采集完—延后推送」的等待窗口内就是最新数据，而非等到 flush 才更新。
-        # overwrite 模式幂等：flush 里仍保留同步作为兜底，同一批事件重写结果一致。
+        # ── 飞书 Base 同步（大盘）已停用（2026-09-22）─────────────────────
+        # 原因：本机 lark-cli 的 user 身份 token 已丢失（notify/lark.py 三处调用都按
+        # LARK_AS=user 走，且无 bot 回退），采集即写每轮必然失败。运营决定暂停飞书表，
+        # 异动数据暂只走企微摘要。恢复时取消下面整段注释（并先跑 lark-cli auth login
+        # 补回 user 授权，或把 .env 的 LARK_AS 改成已授权的 bot）。
+        # 时序说明（恢复时适用）：让在线表在「采集完—延后推送」的等待窗口内就是最新数据，
+        # 而非等到 flush 才更新；overwrite 模式幂等，flush 里仍保留同步作为兜底。
         # 只同步本轮 run_id 的事件——Base 是「覆盖快照」语义，只保留最新一轮；
         # 「最近两轮」补发窗口只用于企微推送补发，不能用在这里，否则午夜 --no-push
         # 遗留的 notified=0 事件会在下一轮和新事件混写进同一批，导致 Base 表里
         # 同时出现两个采集轮次的行（2026-07-13 大盘/服配表叠加事故）。
-        if not dry_run:
-            to_sync = [
-                e for e in database.get_pending_events(conn)
-                if e.get("run_id") == run_id
-                and (e.get("scope_key") or "").startswith(scope_prefix)
-            ]
-            if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
-                from notify.lark import sync_events_to_base
-                written = sync_events_to_base(to_sync, run_id)
-                logger.info("飞书 Base 同步（采集即写）: 写入 %d / %d 条事件", written, len(to_sync))
+        # if not dry_run:
+        #     to_sync = [
+        #         e for e in database.get_pending_events(conn)
+        #         if e.get("run_id") == run_id
+        #         and (e.get("scope_key") or "").startswith(scope_prefix)
+        #     ]
+        #     if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
+        #         from notify.lark import sync_events_to_base
+        #         written = sync_events_to_base(to_sync, run_id)
+        #         logger.info("飞书 Base 同步（采集即写）: 写入 %d / %d 条事件", written, len(to_sync))
 
         # ── 推送 + 同步 ──────────────────────────────────────────
         # 关键：以「数据库里仍待送达的事件」为准，而非仅本进程内存中的 all_events。
@@ -690,14 +694,21 @@ async def _resolve_categories() -> list[dict]:
     if not tree:
         logger.info("类目树缓存不存在或为空，启动浏览器自动发现...")
         from collector.douyin_compass import DouyinCompassCollector
-        async with DouyinCompassCollector() as collector:
-            page = collector._page
-            await page.goto(
-                settings.RANK_ENTRY_URL,
-                wait_until="domcontentloaded", timeout=60000,
-            )
-            await page.wait_for_timeout(3000)
-            tree = await discover_categories(page, settings.TARGET_L1_CATEGORIES)
+        try:
+            async with DouyinCompassCollector() as collector:
+                page = collector._page
+                await page.goto(
+                    settings.RANK_ENTRY_URL,
+                    wait_until="domcontentloaded", timeout=60000,
+                )
+                await page.wait_for_timeout(3000)
+                tree = await discover_categories(page, settings.TARGET_L1_CATEGORIES)
+        except Exception as e:
+            # 缓存过期 + 登录态失效时 discover_categories 会直接抛（Execution context
+            # was destroyed）。不兜住的话整轮采集在 _resolve_categories 就 exit 1，
+            # 而过期缓存里的类目其实照样能采。
+            logger.warning("浏览器自动发现异常，按未发现类目处理: %s", e)
+            tree = None
 
         if tree:
             save_category_tree(cache_path, tree)
@@ -712,14 +723,18 @@ async def _resolve_categories() -> list[dict]:
     elif missing_l1:
         logger.info("类目树缓存缺少 %d 个一级类目: %s，补充发现...", len(missing_l1), list(missing_l1))
         from collector.douyin_compass import DouyinCompassCollector
-        async with DouyinCompassCollector() as collector:
-            page = collector._page
-            await page.goto(
-                settings.RANK_ENTRY_URL,
-                wait_until="domcontentloaded", timeout=60000,
-            )
-            await page.wait_for_timeout(3000)
-            new_tree = await discover_categories(page, list(missing_l1))
+        try:
+            async with DouyinCompassCollector() as collector:
+                page = collector._page
+                await page.goto(
+                    settings.RANK_ENTRY_URL,
+                    wait_until="domcontentloaded", timeout=60000,
+                )
+                await page.wait_for_timeout(3000)
+                new_tree = await discover_categories(page, list(missing_l1))
+        except Exception as e:
+            logger.warning("补充发现异常，按未发现缺失类目处理: %s", e)
+            new_tree = None
 
         if new_tree:
             tree.update(new_tree)
@@ -925,7 +940,7 @@ def _finalize_multi_push(
         category_results=category_results,
     )
 
-    # 飞书 Base 已在采集阶段写入（见 run_multi 采集后的「采集即写」），此处不再重复写。
+    # 飞书 Base 同步已停用（见 run_multi 的「采集即写」那段注释），此处本就不重复写。
     return excel_path
 
 
@@ -948,7 +963,7 @@ def _finalize_acc_push(
     if backlog > 0:
         logger.info("检测到上一轮未送达事件 %d 条，本轮一并补发", backlog)
 
-    # 飞书 Base 已在采集阶段写入（见 run_acc 采集后的「采集即写」），此处不再重复写。
+    # 飞书 Base 同步已停用（见 run_acc 的「采集即写」那段注释），此处本就不重复写。
     wecom_ok = False
     if to_send:
         from notify.wecom import send_summary
@@ -1255,24 +1270,20 @@ async def run_acc(
         # 配饰监控用脱敏价格带（price_bin，如 ¥59.9-¥89.9）已够用。价格列即 compute_diff
         # 写入的 price_range 回退值，无需回填。支付金额/商品图不受影响，照常落表。
 
-        # ── 服配飞书 Base 同步：采集即写（与企微推送时序解耦，等待窗口内表即最新）──
-        # overwrite 模式幂等：flush 里仍保留同步作为兜底，同一批事件重写结果一致。
-        # 只同步本轮 run_id 的事件——Base 是「覆盖快照」语义，只保留最新一轮；
-        # 「最近两轮」补发窗口只用于下面的企微推送（_finalize_acc_push），不能用在这里，
-        # 否则午夜 --no-push 遗留的 notified=0 事件会在下一轮和新事件混写进同一批，
-        # 导致 Base 表里同时出现两个采集轮次的行（2026-07-13 服配表叠加事故）。
-        if not dry_run:
-            to_sync = [
-                e for e in database.get_pending_events(conn)
-                if e.get("run_id") == run_id
-                and (e.get("scope_key") or "").startswith(scope_prefix)
-            ]
-            if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
-                from notify.lark import sync_events_to_base
-                written = sync_events_to_base(
-                    to_sync, run_id, table_id=settings.LARK_ACC_TABLE_ID, include_leaf=True,
-                )
-                logger.info("服配飞书 Base 同步（采集即写）: 写入 %d / %d 条事件", written, len(to_sync))
+        # ── 服配飞书 Base 同步已停用（2026-09-22，原因同大盘：lark-cli user 授权丢失）──
+        # 恢复时取消整段注释，时序约束同大盘那段。
+        # if not dry_run:
+        #     to_sync = [
+        #         e for e in database.get_pending_events(conn)
+        #         if e.get("run_id") == run_id
+        #         and (e.get("scope_key") or "").startswith(scope_prefix)
+        #     ]
+        #     if to_sync and settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
+        #         from notify.lark import sync_events_to_base
+        #         written = sync_events_to_base(
+        #             to_sync, run_id, table_id=settings.LARK_ACC_TABLE_ID, include_leaf=True,
+        #         )
+        #         logger.info("服配飞书 Base 同步（采集即写）: 写入 %d / %d 条事件", written, len(to_sync))
 
         # ── 推送：服配企微消息 + 服配飞书表；不写企微智能表格，不生成 Excel ──
         if dry_run:
