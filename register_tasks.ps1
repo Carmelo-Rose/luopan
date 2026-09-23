@@ -15,8 +15,12 @@ if (-not $isAdmin) {
 Get-ScheduledTask | Where-Object { $_.TaskName -like 'DouyinCompass*' } |
     Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 
+# 90 分钟是 2026-07-08 定的，当时一轮只有「采集 + 推送」，实测约 50 分钟。
+# 2026-07-27 加了服配冷却 20 分钟和推送延迟 15 分钟后没回头改，2026-09-23 实测
+# 单采集轮就要 45 分钟，于是提到 120 分钟。别再往上调：白天 13:30 那轮距下一个
+# 触发点 16:00 只有 150 分钟，而下面是 IgnoreNew——超过 150 分钟会直接吞掉 16:00 那轮。
 $settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 90) `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 120) `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew
 
