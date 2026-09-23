@@ -817,35 +817,41 @@ def _dispatch_summary(
     ts: datetime,
     category_results: list[dict] | None = None,
 ) -> None:
-    """多类目模式：只推送企微摘要（含在线表格链接），不逐条推送事件。"""
-    from notify.wecom import send_summary
-
-    # 构建在线表格链接
-    lark_url = ""
-    if settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
-        lark_url = f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}?table={settings.LARK_TABLE_ID}"
-
-    wecom_sheet_url = settings.WECOM_SMARTSHEET_URL
-
-    delivered = send_summary(
-        settings.WECOM_WEBHOOK_URL,
-        events=events,
-        categories_count=cat_count,
-        timestamp=ts,
-        category_results=category_results,
-        lark_url=lark_url,
-        wecom_sheet_url=wecom_sheet_url,
+    """多类目模式：企微摘要推送已停用（2026-09-23），本轮只落库不发群消息。"""
+    logger.warning(
+        "企微推送已停用（2026-09-23）：%d 条事件保持 notified=0，不发送群消息", len(events),
     )
+    return
 
-    if not delivered:
-        logger.warning("摘要或 Excel 未完整送达，本轮事件保留为待通知")
-        return
-
-    # 只标记本次实际推送的这批事件（含补发的上一轮残留），失败的留待下轮重试
-    ids = [e["id"] for e in events if e.get("id") is not None]
-    if ids:
-        database.mark_events_notified(conn, ids)
-        logger.info("摘要模式: 标记 %d 条事件为已通知", len(ids))
+    # ── 恢复企微推送时删掉上面的 return，并取消下面整段注释 ─────────────────
+    # from notify.wecom import send_summary
+    #
+    # # 构建在线表格链接
+    # lark_url = ""
+    # if settings.LARK_BASE_APP_TOKEN and settings.LARK_TABLE_ID:
+    #     lark_url = f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}?table={settings.LARK_TABLE_ID}"
+    #
+    # wecom_sheet_url = settings.WECOM_SMARTSHEET_URL
+    #
+    # delivered = send_summary(
+    #     settings.WECOM_WEBHOOK_URL,
+    #     events=events,
+    #     categories_count=cat_count,
+    #     timestamp=ts,
+    #     category_results=category_results,
+    #     lark_url=lark_url,
+    #     wecom_sheet_url=wecom_sheet_url,
+    # )
+    #
+    # if not delivered:
+    #     logger.warning("摘要或 Excel 未完整送达，本轮事件保留为待通知")
+    #     return
+    #
+    # # 只标记本次实际推送的这批事件（含补发的上一轮残留），失败的留待下轮重试
+    # ids = [e["id"] for e in events if e.get("id") is not None]
+    # if ids:
+    #     database.mark_events_notified(conn, ids)
+    #     logger.info("摘要模式: 标记 %d 条事件为已通知", len(ids))
 
 
 # ── 延后推送：采集(--no-push)与推送(--flush)解耦 ──────────────────────────
@@ -964,32 +970,40 @@ def _finalize_acc_push(
         logger.info("检测到上一轮未送达事件 %d 条，本轮一并补发", backlog)
 
     # 飞书 Base 同步已停用（见 run_acc 的「采集即写」那段注释），此处本就不重复写。
-    wecom_ok = False
+    # 服配企微推送同样已停用（2026-09-23）：只留库、不发群消息，事件保持 notified=0。
     if to_send:
-        from notify.wecom import send_summary
-        lark_url = ""
-        if settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
-            lark_url = (
-                f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}"
-                f"?table={settings.LARK_ACC_TABLE_ID}"
-            )
-        wecom_ok = send_summary(
-            settings.WECOM_ACC_WEBHOOK_URL,
-            events=to_send,
-            categories_count=categories_collected,
-            timestamp=ts,
-            category_results=[],
-            lark_url=lark_url,
-            wecom_sheet_url="",
+        logger.warning(
+            "服配企微推送已停用（2026-09-23）：%d 条事件保持 notified=0，不发送群消息",
+            len(to_send),
         )
-        logger.info("服配企微摘要推送: %s（%d 条事件）", "成功" if wecom_ok else "失败", len(to_send))
 
-    # 企微推送成功才标记（飞书已在采集阶段写入，不再纳入此处门槛）；失败则保留待下轮补发。
-    if to_send and wecom_ok:
-        ids = [e["id"] for e in to_send if e.get("id") is not None]
-        if ids:
-            database.mark_events_notified(conn, ids)
-            logger.info("服配支线: 标记 %d 条事件为已通知", len(ids))
+    # ── 恢复企微推送时取消下面整段注释 ─────────────────────────────────────
+    # wecom_ok = False
+    # if to_send:
+    #     from notify.wecom import send_summary
+    #     lark_url = ""
+    #     if settings.LARK_BASE_APP_TOKEN and settings.LARK_ACC_TABLE_ID:
+    #         lark_url = (
+    #             f"https://feishu.cn/base/{settings.LARK_BASE_APP_TOKEN}"
+    #             f"?table={settings.LARK_ACC_TABLE_ID}"
+    #         )
+    #     wecom_ok = send_summary(
+    #         settings.WECOM_ACC_WEBHOOK_URL,
+    #         events=to_send,
+    #         categories_count=categories_collected,
+    #         timestamp=ts,
+    #         category_results=[],
+    #         lark_url=lark_url,
+    #         wecom_sheet_url="",
+    #     )
+    #     logger.info("服配企微摘要推送: %s（%d 条事件）", "成功" if wecom_ok else "失败", len(to_send))
+    #
+    # # 企微推送成功才标记（飞书已在采集阶段写入，不再纳入此处门槛）；失败则保留待下轮补发。
+    # if to_send and wecom_ok:
+    #     ids = [e["id"] for e in to_send if e.get("id") is not None]
+    #     if ids:
+    #         database.mark_events_notified(conn, ids)
+    #         logger.info("服配支线: 标记 %d 条事件为已通知", len(ids))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────
