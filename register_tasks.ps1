@@ -15,10 +15,15 @@ if (-not $isAdmin) {
 Get-ScheduledTask | Where-Object { $_.TaskName -like 'DouyinCompass*' } |
     Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 
-# 90 分钟是 2026-07-08 定的，当时一轮只有「采集 + 推送」，实测约 50 分钟。
-# 2026-07-27 加了服配冷却 20 分钟和推送延迟 15 分钟后没回头改，2026-09-23 实测
-# 单采集轮就要 45 分钟，于是提到 120 分钟。别再往上调：白天 13:30 那轮距下一个
-# 触发点 16:00 只有 150 分钟，而下面是 IgnoreNew——超过 150 分钟会直接吞掉 16:00 那轮。
+# 触发间隔是这里最硬的上限，别往上调：白天 13:30 那轮距下一个触发点 16:00 只有
+# 150 分钟，而下面是 IgnoreNew——超过 150 分钟会直接吞掉 16:00 那轮。
+# 一轮实际用掉多少看 run_multi_then_acc.bat 末尾的 Budget 注释（实测采集段约 76 分钟）。
+# 历史上调过两次：90 分钟是 2026-07-08 定的，当时一轮只有「采集 + 推送」，实测约 50
+# 分钟；2026-07-27 加了服配冷却 20 分钟和推送延迟 15 分钟后没回头改，2026-09-23 实测
+# 单采集轮就要 45 分钟，于是提到 120 分钟。
+# 2026-09-24 两条线路各自采集完立即 flush 到自己那条线路的日任务里（库里按 scope 前缀
+# 互相隔离，flush 不碰榜单接口），上面那 15 分钟推送延迟随之去掉，一轮约 76 分钟。
+# 120 分钟这个上限不动。
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 120) `
     -StartWhenAvailable `
