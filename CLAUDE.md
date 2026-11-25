@@ -87,7 +87,8 @@ Key V2 settings:
 - `RANK_API_PATH=video_bring_good`
 - `RANK_TAB_TEXT=短视频榜`
 - `TARGET_L1_CATEGORIES` for `--multi`
-- `EXCLUDE_L2_CATEGORIES` skips named L2 categories under the target L1s (comma-separated, exact match). Filtered in `main.py:_resolve_categories()`'s flatten step, so cached/discovered category trees are untouched — only the collection list is trimmed. Each L2 has its own scope-isolated run history, so excluding one never affects others.
+- `EXCLUDE_L2_CATEGORIES` skips named L2 categories under every target L1 (comma-separated, exact name match). Filtered in `main.py:_resolve_categories()`'s flatten step, so cached/discovered category trees are untouched — only the collection list is trimmed. Each L2 has its own scope-isolated run history, so excluding one never affects others.
+- `EXCLUDE_L1_L2_CATEGORIES` skips exact `L1>L2` pairs (default `服饰内衣>服装` when the env var is unset). Same flatten step; it does not change `EXCLUDE_L2_CATEGORIES` or `--acc`. An empty value disables pair exclusion. Do not put `服装` in `EXCLUDE_L2_CATEGORIES` to drop only 服饰内衣/服装.
 - `ACC_PATH` and `ACC_LEAF_NAMES` for `--acc`
 - `LARK_TABLE_ID` for the main table
 - `LARK_ACC_TABLE_ID` for the accessories table

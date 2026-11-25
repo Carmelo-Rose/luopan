@@ -52,13 +52,26 @@ python run.py --acc --dry-run
 | `BROWSER_USER_DATA_DIR` | Playwright 专用 Chrome Profile，必填 |
 | `RANK_API_PATH` | 默认 `video_bring_good` |
 | `RANK_TAB_TEXT` | 默认 `短视频榜` |
-| `TARGET_L1_CATEGORIES` | `--multi` 采集的一级类目列表，`*` 表示账号可见全部 |
-| `EXCLUDE_L2_CATEGORIES` | 跳过采集/推送的二级类目名单（逗号分隔），留空不排除 |
-| `ACC_PATH` | 服配路径，默认 `服饰内衣,服装,服装配饰` |
+| `TARGET_L1_CATEGORIES` | `--multi` 采集的一级类目列表，`*` 表示账号可见全部。名单里的「图书教育」会动态发现其下全部二级，含「文教文化用品」 |
+| `EXCLUDE_L2_CATEGORIES` | 按二级**名称**跳过，所有一级一起生效。留空不按名称排除。不要填「服装」 |
+| `EXCLUDE_L1_L2_CATEGORIES` | 按「一级>二级」精确跳过，逗号分隔。代码默认 `服饰内衣>服装`。未设置该变量时用默认；显式空值则不按对排除。名称中的 `/` 保留 |
+| `ACC_PATH` | 服配路径，默认 `服饰内衣,服装,服装配饰`。`--acc` 不读上面两个排除键 |
 | `ACC_LEAF_NAMES` | 服配目标叶子，默认 5 个 |
 | `LARK_BASE_APP_TOKEN` / `LARK_TABLE_ID` | 大盘飞书表 |
 | `LARK_ACC_TABLE_ID` | 服配独立飞书表 |
 | `WECOM_WEBHOOK_URL` | 企微摘要 Webhook |
+
+`--multi` 的采集粒度是二级类目。页面路径「图书教育 / 文教文化用品 / 全部」就是图书教育下的二级「文教文化用品」：选中「全部」等于采该二级自身榜，`category_id` 用发现到的二级 id，不把「全部」收成单独类目，也不把图书教育收窄成只采文教。二级 id 由类目发现写入缓存，不在配置里写死。
+
+只让大盘不再采「服饰内衣 > 服装」时，用 `EXCLUDE_L1_L2_CATEGORIES`。`EXCLUDE_L2_CATEGORIES=服装` 会把其他一级下同名「服装」一起跳过。排除只从 `--multi` 的待采集列表拿掉该类目，不改类目树缓存，不删历史 `compass.db` 或已有 scope `video_order_服饰内衣_服装` 的记录。`--acc` 仍走 `ACC_PATH` / `ACC_LEAF_NAMES`。
+
+服务机应用（本仓库默认值不会自动改掉已有 `.env`；不要整文件覆盖现场 `.env`）：
+
+1. 确认 `TARGET_L1_CATEGORIES` 仍包含 `图书教育` 和原来的其他一级。保留一级「服饰内衣」，其下其他二级还要采。
+2. 不要把 `服装` 写入 `EXCLUDE_L2_CATEGORIES`。该键若是空行，保持空行。
+3. `.env` 里没有 `EXCLUDE_L1_L2_CATEGORIES` 时，部署包含该默认值的代码并重启采集进程后，即跳过 `服饰内衣>服装`。
+4. 已经有这一行时，保留或写成 `EXCLUDE_L1_L2_CATEGORIES=服饰内衣>服装`。还有别的「一级>二级」就用逗号接在后面，不要整行换成新内容从而丢掉旧项。
+5. 把该键设成空会关掉按对排除。只改 `EXCLUDE_L2_CATEGORIES` 的默认或留空，不会产生这条排除。
 
 ## 差分事件
 

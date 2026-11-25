@@ -743,25 +743,32 @@ async def _resolve_categories() -> list[dict]:
         else:
             logger.warning("补充发现未找到任何缺失类目，继续使用现有类目缓存")
 
-    # 展平为列表；跳过 EXCLUDE_L2_CATEGORIES 命中的二级类目（不采集、不推送）
+    # 展平为列表。排除只裁采集名单，不改类目树缓存。
+    # EXCLUDE_L2_CATEGORIES：二级名，所有一级一起跳。
+    # EXCLUDE_L1_L2_CATEGORIES：一级+二级成对跳，避免误伤其他一级的同名二级。
     exclude_l2 = set(settings.EXCLUDE_L2_CATEGORIES)
+    exclude_pairs = set(settings.EXCLUDE_L1_L2_CATEGORIES)
     flat = []
     skipped = []
     for l1_name, l2_list in tree.items():
         if not discover_all and l1_name not in target_l1:
             continue
         for l2 in l2_list:
-            if l2["name"] in exclude_l2:
-                skipped.append(f"{l1_name}>{l2['name']}")
+            l2_name = l2["name"]
+            if l2_name in exclude_l2 or (l1_name, l2_name) in exclude_pairs:
+                skipped.append(f"{l1_name}>{l2_name}")
                 continue
             flat.append({
                 "industry_name": l1_name,
-                "category_name": l2["name"],
+                "category_name": l2_name,
                 "industry_id": l2.get("industry_id", ""),
                 "category_id": l2.get("category_id", l2.get("id", "")),
             })
     if skipped:
-        logger.info("按 EXCLUDE_L2_CATEGORIES 跳过 %d 个二级类目: %s", len(skipped), skipped)
+        logger.info(
+            "跳过 %d 个二级类目（按名 EXCLUDE_L2_CATEGORIES，按一级>二级 EXCLUDE_L1_L2_CATEGORIES）: %s",
+            len(skipped), skipped,
+        )
     return flat
 
 
@@ -871,7 +878,8 @@ def _save_summary_sidecar(
 ) -> None:
     """采集完成（--no-push）后落盘摘要上下文，供后续 --flush 还原推送。
 
-    categories_expected 是本轮实际目标类目数（已过滤 EXCLUDE_L2_CATEGORIES 等配置排除项），
+    categories_expected 是本轮实际目标类目数（已过滤 EXCLUDE_L2_CATEGORIES /
+    EXCLUDE_L1_L2_CATEGORIES 等配置排除项），
     供外部风控看板同步脚本判断"是否有类目真的采集失败"，避免它们各自维护一份容易过期的
     硬编码期望值。
     """

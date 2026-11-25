@@ -86,7 +86,9 @@ Key V2 settings:
 
 - `RANK_API_PATH=video_bring_good`
 - `RANK_TAB_TEXT=短视频榜`
-- `TARGET_L1_CATEGORIES` for `--multi`
+- `TARGET_L1_CATEGORIES` for `--multi` (includes 图书教育; its L2s, including 文教文化用品, come from discovery, not a hardcoded id)
+- `EXCLUDE_L2_CATEGORIES` skips an L2 name under every target L1
+- `EXCLUDE_L1_L2_CATEGORIES` skips exact `L1>L2` pairs; unset env uses default `服饰内衣>服装`. `--acc` does not read it
 - `ACC_PATH` and `ACC_LEAF_NAMES` for `--acc`
 - `LARK_TABLE_ID` for the main table
 - `LARK_ACC_TABLE_ID` for the accessories table
