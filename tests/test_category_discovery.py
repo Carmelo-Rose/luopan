@@ -85,6 +85,52 @@ def test_l2_id_is_used_not_the_all_placeholder():
     ]
 
 
+def test_edu_supplies_all_node_is_not_its_own_category():
+    """图书教育/文教文化用品/全部 = 采集该二级自身。id 是夹具，不是线上 id。"""
+    page = AsyncMock()
+    page.evaluate.return_value = {
+        "options": [
+            {
+                "label": "图书教育",
+                "value": "fixture-edu",
+                "children": [
+                    {
+                        "label": "文教文化用品",
+                        "value": "fixture-edu-supplies",
+                        "children": [
+                            {"label": "全部", "value": "0", "isLeaf": True},
+                            {"label": "文具", "value": "fixture-stationery"},
+                        ],
+                    },
+                    {
+                        "label": "书籍/杂志/报纸",
+                        "value": "fixture-edu-books",
+                        "children": [
+                            {"label": "全部", "value": "0", "isLeaf": True},
+                        ],
+                    },
+                ],
+            },
+        ],
+    }
+
+    tree = asyncio.run(discover_categories(page, ["图书教育"]))
+
+    assert tree["图书教育"] == [
+        {
+            "name": "文教文化用品",
+            "category_id": "fixture-edu-supplies",
+            "industry_id": "fixture-edu",
+        },
+        {
+            "name": "书籍/杂志/报纸",
+            "category_id": "fixture-edu-books",
+            "industry_id": "fixture-edu",
+        },
+    ]
+    assert all(item["name"] != "全部" for item in tree["图书教育"])
+
+
 def test_all_placeholder_at_l2_level_is_skipped():
     """若「全部」(value=0) 误入 L2 列，应被跳过而不会产出 category_id=0 的脏数据。"""
     page = AsyncMock()

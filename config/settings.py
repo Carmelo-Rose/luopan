@@ -67,13 +67,50 @@ TARGET_L1_CATEGORIES: list[str] = [
     if s.strip()
 ] if not TARGET_ALL_L1_CATEGORIES else []
 
-# 目标一级类目下需要跳过的二级类目名称（逗号分隔，按名称精确匹配）。
-# 命中的二级类目不采集、不写快照、不推送，对其他二级类目/一级类目无影响
-# （每个二级类目有独立的 scope_key 和差分基线）。留空则不排除任何类目。
+# 目标一级类目下需要跳过的二级类目名称（逗号分隔，按名称精确匹配，所有一级一起跳）。
+# 命中的二级类目不采集、不写快照、不推送，对其他二级类目名无影响
+# （每个二级类目有独立的 scope_key 和差分基线）。留空则不按名称排除。
+# 不要把「服装」写在这里：那会跳过每个一级下叫「服装」的二级。只去掉
+# 「服饰内衣 > 服装」用下面的 EXCLUDE_L1_L2_CATEGORIES。
 _EXCLUDE_L2_RAW = os.getenv("EXCLUDE_L2_CATEGORIES", "").strip()
 EXCLUDE_L2_CATEGORIES: list[str] = [
     s.strip() for s in _EXCLUDE_L2_RAW.split(",") if s.strip()
 ]
+
+# 精确跳过「一级>二级」。与上面按名称排除分开，是因为现场 .env 常把
+# EXCLUDE_L2_CATEGORIES 显式写成空，会盖掉该键的代码默认，写在旧键里部署后不生效。
+# 本键未设置时用代码默认；显式空字符串表示不按一级+二级排除。
+# 「>」是分隔符（类目名里可以有「/」）。只作用于 --multi 的类目展平，--acc 不读。
+_EXCLUDE_L1_L2_DEFAULT = "服饰内衣>服装"
+
+
+def parse_l1_l2_exclusions(raw: str) -> list[tuple[str, str]]:
+    """解析「一级>二级」逗号列表。缺分隔符或空半边的条目忽略。"""
+    pairs: list[tuple[str, str]] = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ">" not in item:
+            _logger.warning(
+                "EXCLUDE_L1_L2_CATEGORIES 条目 %r 缺少分隔符 '>'，已忽略", item
+            )
+            continue
+        l1, l2 = item.split(">", 1)
+        l1, l2 = l1.strip(), l2.strip()
+        if not l1 or not l2:
+            _logger.warning(
+                "EXCLUDE_L1_L2_CATEGORIES 条目 %r 一级或二级为空，已忽略", item
+            )
+            continue
+        pairs.append((l1, l2))
+    return pairs
+
+
+_EXCLUDE_L1_L2_RAW = os.getenv("EXCLUDE_L1_L2_CATEGORIES", _EXCLUDE_L1_L2_DEFAULT)
+EXCLUDE_L1_L2_CATEGORIES: list[tuple[str, str]] = parse_l1_l2_exclusions(
+    _EXCLUDE_L1_L2_RAW
+)
 
 # 服配叶子类目支线：从 L1 到目标父节点的名称路径（逗号分隔）及叶子类目名。
 # 运行时从 category_raw_dump.json 解析 id，不硬编码。
